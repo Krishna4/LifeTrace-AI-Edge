@@ -1,0 +1,35 @@
+name = "lifetrace-ai-edge"
+main = "src/index.ts"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# 1. Cloudflare D1 Serverless Relational SQLite
+# Run: npx wrangler d1 create personal-rag-db
+[[d1_databases]]
+binding = "DB"
+database_name = "personal-rag-db"
+database_id = "<YOUR_D1_DATABASE_ID_HERE>"
+
+# 2. Cloudflare Vectorize Vector Database
+# Run: npx wrangler vectorize create personal-rag-vectors --dimensions=384 --metric=cosine
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "personal-rag-vectors"
+
+# 3. Cloudflare Workers AI (Free tier Llama 3.3 & BGE-Small embeddings)
+[ai]
+binding = "AI"
+
+# 4. Automated Daily Morning Agenda Cron (Runs at 8:00 AM IST = 02:30 UTC / adjust for your timezone)
+[triggers]
+crons = ["30 2 * * *"]
+
+# 5. Environment Variables & Secrets
+# Configure your encrypted secrets via:
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN
+#   npx wrangler secret put TELEGRAM_CHAT_ID
+#   npx wrangler secret put API_KEY
+[vars]
+ENVIRONMENT = "production"
+DEFAULT_USER = "default_user"
+USER_TIMEZONE = "Asia/Kolkata" # Change to your IANA timezone (e.g. America/New_York, UTC, Europe/London)

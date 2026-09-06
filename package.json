@@ -1,0 +1,22 @@
+{
+  "name": "lifetrace-ai-edge",
+  "version": "1.0.0",
+  "description": "100% Native Cloudflare Serverless Personal RAG & Telegram Life Ledger",
+  "main": "src/index.ts",
+  "scripts": {
+    "setup": "bash setup.sh",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "d1:create": "wrangler d1 create personal-rag-db",
+    "d1:migrate": "wrangler d1 execute personal-rag-db --file=schema.sql",
+    "vectorize:create": "wrangler vectorize create personal-rag-vectors --dimensions=384 --metric=cosine"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241022.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.80.0"
+  }
+}
