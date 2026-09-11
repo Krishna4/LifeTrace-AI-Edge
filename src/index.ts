@@ -585,20 +585,34 @@ app.post('/api/v1/documents', async (c) => {
   return c.json({ id: docId, message: 'Document saved and indexed.' }, 201);
 });
 
-// 4. Multimodal RAG Query Engine Helper (with Conversation Memory)
+// 4. Multimodal RAG Query Engine Helper (with Conversation Memory & Similarity Threshold)
 async function executeRagQuery(
   env: Env,
-  query: string,
+  rawQuery: string,
   username: string,
   chatId?: string
-): Promise<{ query: string; answer: string; events: any[]; transactions: any[]; vector_matches: number }> {
+): Promise<{ query: string; answer: string; events: any[]; transactions: any[]; vector_matches: number; sources: string[] }> {
+  // Input sanitization: trim and cap length to 500 chars to avoid CPU/neuron exhaustion
+  const query = (rawQuery || '').trim().slice(0, 500);
+  if (!query) {
+    return {
+      query: '',
+      answer: 'Please provide a non-empty question.',
+      events: [],
+      transactions: [],
+      vector_matches: 0,
+      sources: [],
+    };
+  }
+
   // A. Semantic Search in Vectorize (Dense Vector Similarity)
   let vectorHits: any[] = [];
   try {
     const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [query] });
     const queryVector = embedRes.data[0];
     const vecResults = await env.VECTORIZE.query(queryVector, { topK: 5, returnMetadata: 'all' });
-    vectorHits = vecResults.matches || [];
+    // Similarity threshold filtering (score >= 0.55): discard low-relevance noise to prevent hallucination
+    vectorHits = (vecResults.matches || []).filter((hit: any) => (hit.score ?? 0) >= 0.55);
   } catch (err) {
     console.warn('Vector search warning:', err);
   }
@@ -750,6 +764,24 @@ async function executeRagQuery(
     finalAnswer = `No records found matching '${query}' in your ledger or notes.`;
   }
 
+  // Collect traceable source citations from retrieved context
+  const sourceTags: string[] = [];
+  for (const e of matchingEvents) {
+    sourceTags.push(`Event #${e.id} (${e.title})`);
+  }
+  for (const t of matchingTx) {
+    sourceTags.push(`Tx #${t.id} (${t.entity_person})`);
+  }
+  for (const hit of vectorHits) {
+    if (hit.metadata?.type === 'document' && hit.metadata?.title) {
+      sourceTags.push(`Doc: ${hit.metadata.title}`);
+    } else if (hit.metadata?.id) {
+      const typeLabel = hit.metadata?.type === 'transaction' ? 'Tx' : 'Event';
+      sourceTags.push(`${typeLabel} #${hit.metadata.id}`);
+    }
+  }
+  const uniqueSources = [...new Set(sourceTags)];
+
   // Persist conversation history turn into D1
   if (chatId && finalAnswer) {
     try {
@@ -779,6 +811,7 @@ async function executeRagQuery(
     events: matchingEvents,
     transactions: matchingTx,
     vector_matches: vectorHits.length,
+    sources: uniqueSources,
   };
 }
 
@@ -1011,7 +1044,11 @@ app.post('/telegram/webhook', async (c) => {
   // Natural Language Question via Edge RAG with conversational multi-turn memory
   try {
     const result = await executeRagQuery(c.env, text, username, chatId);
-    await sendTelegramMessage(token, chatId, `🌱 *LifeTrace AI:*\n\n${result.answer}`);
+    let reply = `🌱 *LifeTrace AI:*\n\n${result.answer}`;
+    if (result.sources && result.sources.length > 0) {
+      reply += `\n\n📌 _Sources: ${result.sources.join(', ')}_`;
+    }
+    await sendTelegramMessage(token, chatId, reply);
   } catch (err) {
     await sendTelegramMessage(token, chatId, `⚠️ Error processing request: ${err}`);
   }
