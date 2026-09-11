@@ -4,16 +4,14 @@
 
 ---
 
-![LifeTrace AI Architecture](https://raw.githubusercontent.com/Krishna4/LifeTrace-AI/cloudflare-deployment/docs/banner.png)
-
 ### The "Personal RAG" Reality Check
 
 Every developer dreams of having a true digital "Second Brain":
 - An assistant that remembers every meeting you attended, book you read, and dinner you had.
-- An accountant that tracks your expenses in natural language.
+- An accountant that tracks your expenses in natural language without opening spreadsheets.
 - A private memory layer you can interrogate anytime: *"How much did I spend on groceries in August?"* or *"What did the doctor advise when I visited last month?"*
 
-So you set out to build it. But halfway through the modern AI tutorial hell, your architecture looks something like this:
+So you set out to build it. But halfway through modern AI tutorial hell, your architecture looks something like this:
 - **LLM API:** OpenAI / Anthropic ($20+/month in token charges)
 - **Vector Database:** Pinecone / Qdrant ($30–$70/month or cumbersome Docker containers)
 - **Database & Hosting:** Supabase + Vercel + AWS EC2 ($15+/month to prevent cold starts)
@@ -23,7 +21,7 @@ Before you know it, you are paying **$65 to $100 every single month** just to qu
 
 What if you could run the **entire stack globally on the edge for $0.00/month**, with **zero third-party API dependencies**, sub-500ms latency, and a UI you already have installed on your phone?
 
-Here is how I built **LifeTrace AI**—a completely serverless, multimodal personal RAG system running 100% natively on Cloudflare’s free tier.
+Here is how I built **LifeTrace AI Edge**—a completely serverless, multimodal personal RAG system running 100% natively on Cloudflare’s free tier.
 
 ---
 
@@ -92,12 +90,13 @@ if (/₹|\bINR\b/i.test(rawText)) regexCurrency = 'INR';
 else if (/€|\bEUR\b/i.test(rawText)) regexCurrency = 'EUR';
 else if (/£|\bGBP\b/i.test(rawText)) regexCurrency = 'GBP';
 
+// Match amounts anywhere in the string
 const numberMatch = rawText.match(/(?:([$₹€£])\s*)?(\d+(?:\.\d{1,2})?)(?:\s*([A-Za-z]{3}))?/);
 if (numberMatch && numberMatch[2]) {
   regexAmount = parseFloat(numberMatch[2]);
 }
 
-// 2. Pass to Llama 3.1-8B for semantic categorization and date resolution
+// 2. Pass to Workers AI (Llama 3.1-8B) for semantic categorization and date resolution
 const finalAmount = regexAmount ?? parsedAi?.amount ?? 0;
 ```
 Now, whether you write:
@@ -152,7 +151,7 @@ We implemented **Hybrid Retrieval**:
 
 ## 🚀 How to Deploy Your Own in Under 3 Minutes
 
-You don't need any complex infrastructure experience. The entire project comes with an automated, 1-command deployment wizard.
+You don't need any complex infrastructure experience. The entire project is packaged into an automated, 1-command deployment wizard.
 
 ### Prerequisites
 1. A free [Cloudflare account](https://dash.cloudflare.com/)
@@ -163,8 +162,8 @@ You don't need any complex infrastructure experience. The entire project comes w
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/Krishna4/LifeTrace-AI.git
-cd LifeTrace-AI/cloudflare
+git clone https://github.com/Krishna4/LifeTrace-AI-Edge.git
+cd LifeTrace-AI-Edge
 
 # 2. Install dependencies
 npm install
@@ -176,7 +175,7 @@ npm run setup
 The interactive wizard (`setup.sh`) will automatically:
 - Log you into Cloudflare via Wrangler
 - Provision your serverless **D1 SQLite database** (`personal-rag-db`)
-- Execute the database migrations and schema
+- Execute database migrations and schema
 - Spin up your **Vectorize index** (`personal-rag-vectors`, 384 dimensions)
 - Securely prompt for your Telegram Bot Token and Chat ID
 - Deploy globally to Cloudflare Edge!
@@ -193,8 +192,6 @@ That's it. Your personal AI second brain is live.
 ---
 
 ## 🎮 What It Feels Like to Use
-
-Here is what daily life looks like with LifeTrace AI:
 
 ### 1. Instant Morning Agenda
 Wake up and type `/digest` or `/today`:
@@ -216,7 +213,7 @@ Wake up and type `/digest` or `/today`:
 
 ### 3. Natural Language Search with Memory
 > **You:** "What did I do yesterday?"  
-> **Bot:** "Yesterday, Sept 5th, you attended an AI workshop in the office and travelled 3 hours for it. You also logged an expense of $20 for lunch."  
+> **Bot:** "Yesterday, you attended an AI workshop in the office and travelled 3 hours for it. You also logged an expense of $20 for lunch."  
 > **You:** "Did I meet anyone during lunch?"  
 > **Bot:** "Yes, your notes mention you had lunch with Sarah at Starbucks."
 
@@ -237,10 +234,10 @@ Serverless AI has reached an inflection point. You no longer need thousands of d
 
 Cloudflare's combination of **Workers, D1, Vectorize, and Workers AI** provides a complete, modern stack that is fast, resilient, and completely free for personal use.
 
-- **GitHub Repository**: [Krishna4/LifeTrace-AI](https://github.com/Krishna4/LifeTrace-AI)
+- **GitHub Repository**: [https://github.com/Krishna4/LifeTrace-AI-Edge](https://github.com/Krishna4/LifeTrace-AI-Edge)
 - **License**: MIT (Fork it, clone it, make it yours!)
 
-If this saved you from paying a $50/month AI subscription, drop a ⭐ on [GitHub](https://github.com/Krishna4/LifeTrace-AI) and share it with fellow developers!
+If this saved you from paying a $50/month AI subscription, drop a ⭐ on [GitHub](https://github.com/Krishna4/LifeTrace-AI-Edge) and share it with fellow developers!
 
 ---
 
