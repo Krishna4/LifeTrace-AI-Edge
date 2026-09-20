@@ -818,6 +818,67 @@ app.post('/api/v1/documents', async (c) => {
   return c.json({ id: docId, message: 'Document saved and indexed.' }, 201);
 });
 
+// Admin Vector Sync Endpoint
+app.all('/api/v1/sync-vectors', async (c) => {
+  const { results: transactions } = await c.env.DB.prepare('SELECT * FROM transactions').all();
+  const { results: events } = await c.env.DB.prepare('SELECT * FROM personal_events').all();
+
+  let txCount = 0;
+  for (const t of (transactions || []) as any[]) {
+    try {
+      const textToEmbed = `Financial Transaction: Paid/received ${t.currency} ${t.amount} with ${t.entity_person} on ${t.transaction_date}.${t.notes ? ` Notes: ${t.notes}` : ''}`;
+      const embedRes = await c.env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
+      await c.env.VECTORIZE.upsert([
+        {
+          id: `tx-${t.id}`,
+          values: embedRes.data[0],
+          metadata: {
+            type: 'transaction',
+            id: t.id,
+            entity_person: t.entity_person,
+            amount: t.amount,
+            currency: t.currency,
+            transaction_date: t.transaction_date,
+            username: t.username,
+            text: textToEmbed,
+          },
+        },
+      ]);
+      txCount++;
+    } catch (e) {
+      console.warn(`Failed to re-index tx-${t.id}:`, e);
+    }
+  }
+
+  let eventCount = 0;
+  for (const e of (events || []) as any[]) {
+    try {
+      const textToEmbed = `Event: [${e.category}] ${e.title} on ${e.event_date}.${e.location ? ` Location: ${e.location}.` : ''}${e.entity_person ? ` With: ${e.entity_person}.` : ''}${e.details ? ` Details: ${e.details}` : ''}`;
+      const embedRes = await c.env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
+      await c.env.VECTORIZE.upsert([
+        {
+          id: `event-${e.id}`,
+          values: embedRes.data[0],
+          metadata: {
+            type: 'event',
+            id: e.id,
+            title: e.title,
+            category: e.category,
+            event_date: e.event_date,
+            username: e.username,
+            text: textToEmbed,
+          },
+        },
+      ]);
+      eventCount++;
+    } catch (err) {
+      console.warn(`Failed to re-index event-${e.id}:`, err);
+    }
+  }
+
+  return c.json({ ok: true, reindexed_transactions: txCount, reindexed_events: eventCount });
+});
+
 // 4. Multimodal RAG Query Engine Helper (with Conversation Memory & Similarity Threshold)
 async function executeRagQuery(
   env: Env,
@@ -886,18 +947,18 @@ async function executeRagQuery(
     console.warn('D1 events query error:', e);
   }
 
-  // Search transactions via entity or general money query
+  // Search transactions via entity or general money/expense query
   let matchingTx: any[] = [];
-  const isFinancial = qLower.includes('pay') || qLower.includes('spent') || qLower.includes('cost') || qLower.includes('$') || qLower.includes('money') || qLower.includes('transaction');
+  const isFinancial = /\b(expense|expenses|spend|spent|spending|bought|buy|purchase|purchases|bill|bills|paid|pay|payment|cost|costs|money|transaction|transactions|finance|financial|ledger|inr|usd|eur|gbp|rs|₹|\$)\b/i.test(query);
   try {
     if (isFinancial) {
       const { results } = await env.DB.prepare(
-        'SELECT * FROM transactions WHERE username = ? ORDER BY transaction_date DESC LIMIT 5'
+        'SELECT * FROM transactions WHERE username = ? ORDER BY transaction_date DESC, id DESC LIMIT 15'
       ).bind(username).all();
       matchingTx = results || [];
     } else {
       const { results } = await env.DB.prepare(
-        'SELECT * FROM transactions WHERE username = ? AND (LOWER(entity_person) LIKE ? OR LOWER(notes) LIKE ?) ORDER BY transaction_date DESC LIMIT 5'
+        'SELECT * FROM transactions WHERE username = ? AND (LOWER(entity_person) LIKE ? OR LOWER(notes) LIKE ?) ORDER BY transaction_date DESC, id DESC LIMIT 10'
       ).bind(username, `%${qLower}%`, `%${qLower}%`).all();
       matchingTx = results || [];
     }
@@ -920,12 +981,12 @@ async function executeRagQuery(
 
   // 2. Structured D1 Events
   if (matchingEvents.length > 0) {
-    contextParts.push(`Events in Ledger:\n${matchingEvents.map(e => `- [${e.category}] ${e.title} on ${e.event_date} at ${e.location || 'N/A'} with ${e.entity_person || 'N/A'}${e.details ? `. Note: ${e.details}` : ''}`).join('\n')}`);
+    contextParts.push(`Events in Ledger:\n${matchingEvents.map(e => `- [Event #${e.id}] [${e.category}] ${e.title} on ${e.event_date} at ${e.location || 'N/A'} with ${e.entity_person || 'N/A'}${e.details ? `. Note: ${e.details}` : ''}`).join('\n')}`);
   }
 
   // 3. Structured D1 Transactions
   if (matchingTx.length > 0) {
-    contextParts.push(`Financial Records:\n${matchingTx.map(t => `- Paid/received $${t.amount} ${t.currency} with ${t.entity_person} on ${t.transaction_date}${t.notes ? ` (${t.notes})` : ''}`).join('\n')}`);
+    contextParts.push(`Financial Records:\n${matchingTx.map(t => `- [Tx #${t.id}] Paid/received ${t.currency} ${formatAmount(t.amount, t.currency)} (${t.currency}) for/with ${t.entity_person} on ${t.transaction_date}${t.notes ? ` (Notes: ${t.notes})` : ''}`).join('\n')}`);
   }
 
   // 4. Conversation History (Multi-turn chat memory)
@@ -1229,6 +1290,40 @@ app.post('/telegram/webhook', async (c) => {
       (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
       `\n_Tip: Type /expenses to view recent transactions or /today for agenda._`;
     await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
+  // /sync: Re-index all ledger records into Vectorize
+  if (cmd === '/sync') {
+    const { results: transactions } = await c.env.DB.prepare('SELECT * FROM transactions WHERE username = ?').bind(username).all();
+    const { results: events } = await c.env.DB.prepare('SELECT * FROM personal_events WHERE username = ?').bind(username).all();
+    let txCount = 0;
+    for (const t of (transactions || []) as any[]) {
+      try {
+        const textToEmbed = `Financial Transaction: Paid/received ${t.currency} ${t.amount} with ${t.entity_person} on ${t.transaction_date}.${t.notes ? ` Notes: ${t.notes}` : ''}`;
+        const embedRes = await c.env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
+        await c.env.VECTORIZE.upsert([
+          {
+            id: `tx-${t.id}`,
+            values: embedRes.data[0],
+            metadata: {
+              type: 'transaction',
+              id: t.id,
+              entity_person: t.entity_person,
+              amount: t.amount,
+              currency: t.currency,
+              transaction_date: t.transaction_date,
+              username: t.username,
+              text: textToEmbed,
+            },
+          },
+        ]);
+        txCount++;
+      } catch (e) {
+        console.warn('Sync vector tx error:', e);
+      }
+    }
+    await sendTelegramMessage(token, chatId, `🔄 *Ledger Synced:*\n• Re-indexed ${txCount} transactions and ${(events || []).length} events into Vectorize.`);
     return c.json({ ok: true });
   }
 
