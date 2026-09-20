@@ -391,6 +391,77 @@ Rules:
   };
 }
 
+function formatAmount(amount: number, currency: string): string {
+  try {
+    const locale = currency === 'INR' ? 'en-IN' : 'en-US';
+    return Number(amount).toLocaleString(locale, { maximumFractionDigits: 2 });
+  } catch {
+    return String(amount);
+  }
+}
+
+function parseAmountAndCurrency(rawText: string): { amount: number | null; currency: string } {
+  let currency = 'USD';
+  if (/₹|\bINR\b|\bRS\.?\b/i.test(rawText)) currency = 'INR';
+  else if (/€|\bEUR\b/i.test(rawText)) currency = 'EUR';
+  else if (/£|\bGBP\b/i.test(rawText)) currency = 'GBP';
+  else if (/\$|\bUSD\b/i.test(rawText)) currency = 'USD';
+
+  // 1. Currency prefix + amount: e.g. "INR 2,00,000.00", "Rs. 2,71,690", "₹1,500", "$50.25"
+  const prefixMatch = rawText.match(
+    /(?:(INR|RS\.?|₹|\$|€|£)\s*)([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/i
+  );
+  if (prefixMatch && prefixMatch[2]) {
+    const sym = prefixMatch[1].toUpperCase();
+    if (sym === '₹' || sym.startsWith('RS') || sym === 'INR') currency = 'INR';
+    else if (sym === '€' || sym === 'EUR') currency = 'EUR';
+    else if (sym === '£' || sym === 'GBP') currency = 'GBP';
+    else if (sym === '$' || sym === 'USD') currency = 'USD';
+
+    const num = parseFloat(prefixMatch[2].replace(/,/g, ''));
+    if (!isNaN(num) && num > 0) {
+      return { amount: num, currency };
+    }
+  }
+
+  // 2. Amount + currency suffix: e.g. "2,71,690 INR", "50 USD", "2000 EUR"
+  const suffixMatch = rawText.match(
+    /([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\s*(INR|USD|EUR|GBP|₹|\$|€|£)\b/i
+  );
+  if (suffixMatch && suffixMatch[1]) {
+    const sym = suffixMatch[2].toUpperCase();
+    if (sym === '₹' || sym.startsWith('RS') || sym === 'INR') currency = 'INR';
+    else if (sym === '€' || sym === 'EUR') currency = 'EUR';
+    else if (sym === '£' || sym === 'GBP') currency = 'GBP';
+    else if (sym === '$' || sym === 'USD') currency = 'USD';
+
+    const num = parseFloat(suffixMatch[1].replace(/,/g, ''));
+    if (!isNaN(num) && num > 0) {
+      return { amount: num, currency };
+    }
+  }
+
+  // 3. Standalone number formatted with commas: e.g. "2,00,000.00", "2,71,690"
+  const commaMatch = rawText.match(/\b([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?)\b/);
+  if (commaMatch && commaMatch[1]) {
+    const num = parseFloat(commaMatch[1].replace(/,/g, ''));
+    if (!isNaN(num) && num > 0) {
+      return { amount: num, currency };
+    }
+  }
+
+  // 4. Standalone simple number in short spend commands: e.g. "/spend 50 groceries", "lunch 20.50"
+  const standaloneMatch = rawText.match(/(?:^|\s)([0-9]{1,6}(?:\.[0-9]{1,2})?)(?:\s|$)/);
+  if (standaloneMatch && standaloneMatch[1]) {
+    const num = parseFloat(standaloneMatch[1]);
+    if (!isNaN(num) && num > 0) {
+      return { amount: num, currency };
+    }
+  }
+
+  return { amount: null, currency };
+}
+
 async function extractAndLogExpense(
   env: Env,
   rawText: string,
@@ -400,58 +471,38 @@ async function extractAndLogExpense(
   let parsed: any = null;
 
   // 1. Fast deterministic regex extraction
-  let regexAmount: number | null = null;
-  let regexCurrency = 'USD';
+  const regexResult = parseAmountAndCurrency(rawText);
   let regexEntity = 'General Expense';
   let regexNotes = rawText.trim();
 
-  // Check currency symbols / codes anywhere in text
-  if (/₹|\bINR\b/i.test(rawText)) regexCurrency = 'INR';
-  else if (/€|\bEUR\b/i.test(rawText)) regexCurrency = 'EUR';
-  else if (/£|\bGBP\b/i.test(rawText)) regexCurrency = 'GBP';
-
-  // Match amount anywhere in string: e.g. "50 groceries", "$50 dinner", "lunch 20.50", "petrol 500 INR"
-  const numberMatch = rawText.match(/(?:([$₹€£])\s*)?(\d+(?:\.\d{1,2})?)(?:\s*([A-Za-z]{3}))?/);
-  if (numberMatch && numberMatch[2]) {
-    regexAmount = parseFloat(numberMatch[2]);
-    if (numberMatch[1]) {
-      if (numberMatch[1] === '₹') regexCurrency = 'INR';
-      else if (numberMatch[1] === '€') regexCurrency = 'EUR';
-      else if (numberMatch[1] === '£') regexCurrency = 'GBP';
-    }
-    if (numberMatch[3]) {
-      const code = numberMatch[3].toUpperCase();
-      if (['USD', 'INR', 'EUR', 'GBP', 'CAD', 'AUD', 'SGD'].includes(code)) {
-        regexCurrency = code;
-      }
-    }
-
-    // Derive entity by stripping the amount and common prepositions
-    const stripped = rawText
-      .replace(numberMatch[0], '')
-      .replace(/[$₹€£]/g, '')
-      .replace(/\b(for|on|at|to|spent|bought|paid|INR|USD|EUR|GBP)\b/gi, '')
-      .trim();
-    if (stripped) {
-      regexEntity = stripped;
-      regexNotes = stripped;
-    }
+  // Strip common bank SMS noise, currency symbols, and amount to get fallback entity
+  const stripped = rawText
+    .replace(/\bAlert:?\b/gi, '')
+    .replace(/(?:INR|RS\.?|₹|\$|€|£)\s*[0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?/gi, '')
+    .replace(/\b(for|on|at|to|spent|bought|paid|INR|USD|EUR|GBP)\b/gi, '')
+    .replace(/[$₹€£]/g, '')
+    .replace(/[-*#]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (stripped) {
+    regexEntity = stripped.slice(0, 80);
+    regexNotes = stripped;
   }
 
-  // 2. AI Extraction for deeper context and classification
+  // 2. AI Extraction for deeper context, merchant detection and SMS parsing
   try {
     const aiRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fp8', {
       messages: [
         {
           role: 'system',
           content: `You are a financial transaction extraction assistant. Today's date is ${todayStr}.
-Extract the transaction into a single JSON object with this schema:
+Analyze the user message (which may be a bank SMS alert, credit card notification, or simple spend note) and extract into a single JSON object with this schema:
 {
-  "entity_person": "Vendor, item, or category (e.g. Starbucks, Groceries, Uber, Petrol)",
-  "amount": number,
+  "entity_person": "Vendor, merchant, store, or category (e.g. G R T JEWELL, Starbucks, Amazon, Groceries)",
+  "amount": number (numeric value only, e.g. 200000 or 271690. Remove all commas, currency symbols, and extra characters. Do NOT use card numbers, account numbers, phone numbers, or dates as amount),
   "currency": "USD" | "INR" | "EUR" | "GBP",
-  "transaction_date": "YYYY-MM-DD (resolve words like yesterday relative to ${todayStr})",
-  "notes": "additional notes or description"
+  "transaction_date": "YYYY-MM-DD (resolve words like yesterday, or dates in SMS like 20-Sep-26 or 20 September 2026 into YYYY-MM-DD. Never return relative strings like '-1 month')",
+  "notes": "card info, bank name, reference or short description"
 }
 Return ONLY valid JSON without markdown code fences:`,
         },
@@ -476,17 +527,36 @@ Return ONLY valid JSON without markdown code fences:`,
     console.warn('AI expense extraction warning:', err);
   }
 
-  // Deterministic values always take precedence or fallback seamlessly
-  const finalAmount = (regexAmount !== null && regexAmount > 0)
-    ? regexAmount
-    : (Number(parsed?.amount) || 0);
+  // Parse AI amount cleanly: handle numbers or string with commas (e.g. "2,00,000.00" or 200000)
+  let aiAmount: number | null = null;
+  if (parsed?.amount !== undefined && parsed?.amount !== null) {
+    const cleanAiStr = String(parsed.amount).replace(/,/g, '').trim();
+    const val = parseFloat(cleanAiStr);
+    if (!isNaN(val) && val > 0) {
+      aiAmount = val;
+    }
+  }
 
-  const entity = (parsed?.entity_person && parsed.entity_person !== 'General Expense')
-    ? parsed.entity_person
+  // Prioritize AI if it found a valid amount, otherwise use regex fallback
+  const finalAmount = (aiAmount !== null && aiAmount > 0)
+    ? aiAmount
+    : (regexResult.amount !== null && regexResult.amount > 0 ? regexResult.amount : 0);
+
+  const entity = (parsed?.entity_person && typeof parsed.entity_person === 'string' && parsed.entity_person !== 'General Expense' && parsed.entity_person.trim().length > 0)
+    ? parsed.entity_person.trim()
     : regexEntity;
 
-  const currency = (parsed?.currency || regexCurrency || 'USD').toUpperCase();
-  const txDate = parsed?.transaction_date || todayStr;
+  let currency = (parsed?.currency || regexResult.currency || 'USD').toUpperCase();
+  if (currency === 'RS' || currency === 'RS.') currency = 'INR';
+  if (!['USD', 'INR', 'EUR', 'GBP', 'CAD', 'AUD', 'SGD'].includes(currency)) {
+    currency = regexResult.currency || 'USD';
+  }
+
+  const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+  const txDate = (parsed?.transaction_date && typeof parsed.transaction_date === 'string' && dateRegex.test(parsed.transaction_date))
+    ? parsed.transaction_date
+    : todayStr;
+
   const notes = parsed?.notes || regexNotes || rawText;
 
   const stmt = env.DB.prepare(`
@@ -659,14 +729,17 @@ app.post('/api/v1/transactions', async (c) => {
   const body = await c.req.json();
   const username = body.username || c.env.DEFAULT_USER || 'default_user';
   const entity = body.entity_person;
-  const amount = Number(body.amount);
+  const rawAmount = body.amount;
+  const amount = typeof rawAmount === 'number'
+    ? rawAmount
+    : parseFloat(String(rawAmount || '').replace(/,/g, ''));
   const currency = (body.currency || 'USD').toUpperCase();
   const txDate = body.transaction_date || new Date().toISOString().split('T')[0];
   const notes = body.notes || null;
   const isSecure = body.is_secure ? 1 : 0;
 
-  if (!entity || isNaN(amount)) {
-    return c.json({ error: 'entity_person and amount are required' }, 400);
+  if (!entity || isNaN(amount) || amount <= 0) {
+    return c.json({ error: 'entity_person and a valid positive amount are required' }, 400);
   }
 
   const stmt = c.env.DB.prepare(`
@@ -1098,7 +1171,7 @@ app.post('/telegram/webhook', async (c) => {
     const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
     const lines = (results || []).map((t: any) => {
       const sym = symbolMap[t.currency] || `${t.currency} `;
-      return `• (ID: \`#${t.id}\`) *${t.entity_person}:* ${sym}${t.amount} (${t.currency}) on \`${t.transaction_date}\``;
+      return `• (ID: \`#${t.id}\`) *${t.entity_person}:* ${sym}${formatAmount(t.amount, t.currency)} (${t.currency}) on \`${t.transaction_date}\``;
     });
     const reply = lines.length ? `💰 *Recent Transactions:*\n${lines.join('\n')}\n\n_Tip: Type /delete_expense <id> to remove an entry._` : 'No transactions found.';
     await sendTelegramMessage(token, chatId, reply);
@@ -1151,7 +1224,7 @@ app.post('/telegram/webhook', async (c) => {
     const reply = 
       `💰 *Expense Logged:*\n` +
       `• *Item / Vendor:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
-      `• *Amount:* ${sym}${tx.amount} (${tx.currency})\n` +
+      `• *Amount:* ${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
       `• *Date:* \`${tx.transaction_date}\`\n` +
       (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
       `\n_Tip: Type /expenses to view recent transactions or /today for agenda._`;
