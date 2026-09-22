@@ -400,14 +400,14 @@ function formatAmount(amount: number, currency: string): string {
   }
 }
 
-function parseAmountAndCurrency(rawText: string): { amount: number | null; currency: string } {
+function parseAmountAndCurrency(rawText: string): { amount: number | null; currency: string; isCurrencyAnchored: boolean } {
   let currency = 'USD';
   if (/₹|\bINR\b|\bRS\.?\b/i.test(rawText)) currency = 'INR';
   else if (/€|\bEUR\b/i.test(rawText)) currency = 'EUR';
   else if (/£|\bGBP\b/i.test(rawText)) currency = 'GBP';
   else if (/\$|\bUSD\b/i.test(rawText)) currency = 'USD';
 
-  // 1. Currency prefix + amount: e.g. "INR 2,00,000.00", "Rs. 2,71,690", "₹1,500", "$50.25"
+  // 1. Currency prefix + amount: e.g. "INR 2,00,000.00", "Rs. 2,71,690", "Rs. 190", "₹1,500", "$50.25"
   const prefixMatch = rawText.match(
     /(?:(INR|RS\.?|₹|\$|€|£)\s*)([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/i
   );
@@ -420,13 +420,13 @@ function parseAmountAndCurrency(rawText: string): { amount: number | null; curre
 
     const num = parseFloat(prefixMatch[2].replace(/,/g, ''));
     if (!isNaN(num) && num > 0) {
-      return { amount: num, currency };
+      return { amount: num, currency, isCurrencyAnchored: true };
     }
   }
 
-  // 2. Amount + currency suffix: e.g. "2,71,690 INR", "50 USD", "2000 EUR"
+  // 2. Amount + currency suffix: e.g. "2,71,690 INR", "50 USD", "2000 EUR", "190 Rs"
   const suffixMatch = rawText.match(
-    /([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\s*(INR|USD|EUR|GBP|₹|\$|€|£)\b/i
+    /([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\s*(INR|USD|EUR|GBP|₹|\$|€|£|RS\.?)\b/i
   );
   if (suffixMatch && suffixMatch[1]) {
     const sym = suffixMatch[2].toUpperCase();
@@ -437,7 +437,7 @@ function parseAmountAndCurrency(rawText: string): { amount: number | null; curre
 
     const num = parseFloat(suffixMatch[1].replace(/,/g, ''));
     if (!isNaN(num) && num > 0) {
-      return { amount: num, currency };
+      return { amount: num, currency, isCurrencyAnchored: true };
     }
   }
 
@@ -446,7 +446,7 @@ function parseAmountAndCurrency(rawText: string): { amount: number | null; curre
   if (commaMatch && commaMatch[1]) {
     const num = parseFloat(commaMatch[1].replace(/,/g, ''));
     if (!isNaN(num) && num > 0) {
-      return { amount: num, currency };
+      return { amount: num, currency, isCurrencyAnchored: true };
     }
   }
 
@@ -455,11 +455,11 @@ function parseAmountAndCurrency(rawText: string): { amount: number | null; curre
   if (standaloneMatch && standaloneMatch[1]) {
     const num = parseFloat(standaloneMatch[1]);
     if (!isNaN(num) && num > 0) {
-      return { amount: num, currency };
+      return { amount: num, currency, isCurrencyAnchored: false };
     }
   }
 
-  return { amount: null, currency };
+  return { amount: null, currency, isCurrencyAnchored: false };
 }
 
 async function extractAndLogExpense(
@@ -498,10 +498,10 @@ async function extractAndLogExpense(
           content: `You are a financial transaction extraction assistant. Today's date is ${todayStr}.
 Analyze the user message (which may be a bank SMS alert, credit card notification, or simple spend note) and extract into a single JSON object with this schema:
 {
-  "entity_person": "Vendor, merchant, store, or category (e.g. G R T JEWELL, Starbucks, Amazon, Groceries)",
-  "amount": number (numeric value only, e.g. 200000 or 271690. Remove all commas, currency symbols, and extra characters. Do NOT use card numbers, account numbers, phone numbers, or dates as amount),
+  "entity_person": "Vendor, merchant, store, or category (e.g. Ramreddy chicken market, G R T JEWELL, Starbucks, Amazon, Groceries)",
+  "amount": number (The actual currency amount in RUPEES or DOLLARS, NOT in paise or cents! E.g. For 'Rs. 190', amount MUST BE 190, NEVER 19000. Do NOT multiply by 100. Do NOT use card numbers, account numbers, UPI reference numbers, phone numbers, or dates as amount),
   "currency": "USD" | "INR" | "EUR" | "GBP",
-  "transaction_date": "YYYY-MM-DD (resolve words like yesterday, or dates in SMS like 20-Sep-26 or 20 September 2026 into YYYY-MM-DD. Never return relative strings like '-1 month')",
+  "transaction_date": "YYYY-MM-DD (resolve words like yesterday, or dates in SMS like 21-Sep-26 into YYYY-MM-DD. Never return relative strings like '-1 month')",
   "notes": "card info, bank name, reference or short description"
 }
 Return ONLY valid JSON without markdown code fences:`,
@@ -537,10 +537,22 @@ Return ONLY valid JSON without markdown code fences:`,
     }
   }
 
-  // Prioritize AI if it found a valid amount, otherwise use regex fallback
-  const finalAmount = (aiAmount !== null && aiAmount > 0)
-    ? aiAmount
-    : (regexResult.amount !== null && regexResult.amount > 0 ? regexResult.amount : 0);
+  // Determine final amount:
+  // If regex found an explicit currency-anchored amount (e.g. "Rs. 190", "INR 2,00,000.00", "₹1,500", "$50.25"),
+  // that directly attached number is our ground truth.
+  // This completely eliminates LLM hallucinations (such as converting rupees to paise: 190 -> 19000).
+  let finalAmount = 0;
+  if (regexResult.isCurrencyAnchored && regexResult.amount !== null && regexResult.amount > 0) {
+    finalAmount = regexResult.amount;
+  } else if (aiAmount !== null && aiAmount > 0) {
+    if (regexResult.amount !== null && Math.abs(aiAmount - regexResult.amount * 100) < 0.01) {
+      finalAmount = regexResult.amount;
+    } else {
+      finalAmount = aiAmount;
+    }
+  } else if (regexResult.amount !== null && regexResult.amount > 0) {
+    finalAmount = regexResult.amount;
+  }
 
   const entity = (parsed?.entity_person && typeof parsed.entity_person === 'string' && parsed.entity_person !== 'General Expense' && parsed.entity_person.trim().length > 0)
     ? parsed.entity_person.trim()
