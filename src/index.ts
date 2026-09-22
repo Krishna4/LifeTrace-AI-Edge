@@ -717,16 +717,39 @@ app.all('/sms/webhook', async (c) => {
 
   // Otherwise, log as personal note in D1 documents
   const stmt = c.env.DB.prepare(`
-    INSERT INTO documents (file_path, file_type, file_size_bytes, username, source_name)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO documents (file_path, file_type, file_size_bytes, username, source_name, metadata_json)
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
-  await stmt.bind(`sms/${Date.now()}`, 'text/plain', rawText.length, username, sender || 'Phone SMS').run();
+  await stmt.bind(`sms/${Date.now()}`, 'text/plain', rawText.length, username, sender || 'Phone SMS', JSON.stringify({ text: rawText, sender })).run();
   
   if (token && chatId) {
     await sendTelegramMessage(token, chatId, `📱 *SMS Note Received:*\n_${rawText.slice(0, 300)}_\n${sender ? `• Sender: \`${sender}\`` : ''}`);
   }
 
   return c.json({ success: true, type: 'note', text: rawText });
+});
+
+// View recent SMS / Webhook logs
+app.get('/sms/recent', async (c) => {
+  const { results: docs } = await c.env.DB.prepare(
+    "SELECT id, source_name as sender, file_size_bytes, metadata_json, created_at FROM documents WHERE file_path LIKE 'sms/%' ORDER BY id DESC LIMIT 10"
+  ).all();
+
+  const { results: recentTx } = await c.env.DB.prepare(
+    "SELECT id, entity_person, amount, currency, transaction_date, notes, created_at FROM transactions ORDER BY id DESC LIMIT 5"
+  ).all();
+
+  return c.json({
+    recent_sms_notes: (docs || []).map((d: any) => {
+      let text = '';
+      try {
+        const meta = JSON.parse(d.metadata_json || '{}');
+        text = meta.text || '';
+      } catch {}
+      return { id: d.id, sender: d.sender, text, created_at: d.created_at };
+    }),
+    recent_transactions: recentTx || [],
+  });
 });
 
 // 1. Events Endpoints
@@ -1353,6 +1376,24 @@ app.post('/telegram/webhook', async (c) => {
       return `• (ID: \`#${t.id}\`) *${t.entity_person}:* ${sym}${formatAmount(t.amount, t.currency)} (${t.currency}) on \`${t.transaction_date}\``;
     });
     const reply = lines.length ? `💰 *Recent Transactions:*\n${lines.join('\n')}\n\n_Tip: Type /delete_expense <id> to remove an entry._` : 'No transactions found.';
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
+  // /sms: View recent SMS messages received from MacroDroid / webhook
+  if (cmd === '/sms' || cmd === '/messages') {
+    const { results } = await c.env.DB.prepare(
+      "SELECT id, source_name as sender, metadata_json, created_at FROM documents WHERE file_path LIKE 'sms/%' ORDER BY id DESC LIMIT 5"
+    ).all();
+    const lines = (results || []).map((d: any) => {
+      let snippet = '';
+      try {
+        const meta = JSON.parse(d.metadata_json || '{}');
+        snippet = meta.text || '';
+      } catch {}
+      return `• \`#${d.id}\` from *${d.sender || 'Unknown'}* (\`${d.created_at}\`):\n  _${snippet.slice(0, 150) || '(No preview)'}_`;
+    });
+    const reply = lines.length ? `📱 *Recent SMS Received from Phone:*\n\n${lines.join('\n\n')}` : 'No SMS messages logged yet.';
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
