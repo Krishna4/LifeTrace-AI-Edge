@@ -1372,17 +1372,53 @@ app.post('/telegram/webhook', async (c) => {
     return c.json({ ok: true });
   }
 
-  // Heuristic for natural language event & reminder logging
-  const isQuestion = text.endsWith('?') || /^(what|who|when|where|why|how|is|are|did|can|could|do|show|list)\b/i.test(text);
+  // Intelligent Natural Language Message Classifier & Router:
+  // Decides whether a message is:
+  // 1. A Financial Transaction / Expense (bank SMS, spend notes)
+  // 2. An Event / Reminder / Life Log
+  // 3. A Question / Search query (routes to RAG)
+
+  const trimmedText = text.trim();
+  const isQuestion = trimmedText.endsWith('?') || /^(what|who|when|where|why|how|is|are|did|can|could|do|does|will|show|list|summarize|tell me|give me|check|find)\b/i.test(trimmedText);
+
+  // 1. Automatic Financial Transaction / Bank SMS Detection
+  const hasCurrencyOrAmount = /(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$))/i.test(trimmedText);
+  const isBankSms = !isQuestion && (
+    // Bank & Card SMS keywords: spent/debited/charged/transferred along with bank/card/account/ref/UPI markers
+    (/\b(spent|debited|debited by|charged|paid to|sent to|withdrawn|transaction of)\b/i.test(trimmedText) &&
+     (/\b(card|credit card|debit card|a\/c|acct|account|upi|vpa|ref|slice|amex|hdfc|sbi|icici|axis|kotak|pnb|paytm|gpay|phonepe)\b/i.test(trimmedText) || hasCurrencyOrAmount)) ||
+    // Starts with "Spent", "Paid", "Bought", "Purchased" followed by currency/amount
+    /^(spent|paid|bought|purchased)\s+([$₹€£]?[0-9]+)/i.test(trimmedText) ||
+    // Raw spend format e.g. "coffee 4.50", "petrol 2000 inr", "groceries $50"
+    /^(?:coffee|groceries|petrol|fuel|uber|ola|swiggy|zomato|dinner|lunch|breakfast|milk|vegetables|medicine)\s+[$₹€£]?[0-9]+/i.test(trimmedText)
+  );
+
+  if (isBankSms) {
+    const { tx } = await extractAndLogExpense(c.env, trimmedText, username);
+    const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+    const sym = symbolMap[tx.currency] || `${tx.currency} `;
+    const reply = 
+      `💰 *Expense Logged Automatically:*\n` +
+      `• *Item / Vendor:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
+      `• *Amount:* ${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
+      `• *Date:* \`${tx.transaction_date}\`\n` +
+      (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
+      `\n_Tip: Type /expenses to view recent transactions or /today for agenda._`;
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
+  // 2. Automatic Event / Reminder / Life Log Detection
   const isEventStatement = !isQuestion && (
-    /^(i attended|attended|went to|visited|had lunch with|had dinner with|had a meeting with|met with|flying to|flight to|booked|participated in)/i.test(text) ||
-    /^(today|yesterday|tomorrow)\s+(i|we|there is|there was|i'm|i am)\b/i.test(text) ||
-    /^(remind me|reminder|set a reminder|remember to|don't forget|dont forget)\b/i.test(text) ||
-    /\b(everyday|every day|daily reminder)\b/i.test(text)
+    /^(i attended|attended|went to|visited|had lunch with|had dinner with|had a meeting with|met with|flying to|flight to|booked|participated in)/i.test(trimmedText) ||
+    /^(today|yesterday|tomorrow)\s+(i|we|there is|there was|i'm|i am)\b/i.test(trimmedText) ||
+    /^(remind me|reminder|set a reminder|remember to|don't forget|dont forget)\b/i.test(trimmedText) ||
+    /\b(everyday|every day|daily reminder)\b/i.test(trimmedText) ||
+    /\b(doctor appointment|dentist appointment|meeting at|sync at|call with)\b/i.test(trimmedText)
   );
 
   if (isEventStatement) {
-    const { events } = await extractAndLogEvent(c.env, text, username);
+    const { events } = await extractAndLogEvent(c.env, trimmedText, username);
     if (events && events.length > 0) {
       let reply = '';
       if (events.length === 1) {
