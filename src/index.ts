@@ -623,6 +623,112 @@ app.get('/', (c) => {
   });
 });
 
+// --- Dedicated Phone SMS Ingestion Webhook (for MacroDroid / Tasker / Shortcuts) ---
+// Accepts JSON, Form Data, Plain Text, or Query Parameters from mobile automation apps
+app.all('/sms/webhook', async (c) => {
+  let rawText = '';
+  let sender = '';
+
+  // 1. Parse request body (JSON, Form Data, or Text)
+  try {
+    const contentType = c.req.header('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const json = await c.req.json();
+      rawText = json.message || json.text || json.sms || json.body || json.content || '';
+      sender = json.from || json.sender || json.number || '';
+    } else if (contentType.includes('form')) {
+      const form = await c.req.parseBody();
+      rawText = String(form.message || form.text || form.sms || form.body || '');
+      sender = String(form.from || form.sender || form.number || '');
+    } else {
+      rawText = await c.req.text();
+    }
+  } catch {
+    try {
+      rawText = await c.req.text();
+    } catch {}
+  }
+
+  // 2. Query param fallback
+  if (!rawText || !rawText.trim()) {
+    rawText = c.req.query('message') || c.req.query('text') || c.req.query('sms') || '';
+    sender = c.req.query('from') || c.req.query('sender') || sender;
+  }
+
+  rawText = (rawText || '').trim();
+  if (!rawText) {
+    return c.json({ error: 'No SMS message text found in payload. Provide `message` in JSON, form body, or query param.' }, 400);
+  }
+
+  const username = c.env.DEFAULT_USER || 'default_user';
+  const token = c.env.TELEGRAM_BOT_TOKEN;
+  const chatId = c.env.TELEGRAM_CHAT_ID;
+
+  // Intelligent Classification: Expense vs Event vs Note
+  const hasCurrencyOrAmount = /(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$))/i.test(rawText);
+  const isBankSms = (
+    (/\b(spent|debited|debited by|charged|paid to|sent to|withdrawn|transaction of)\b/i.test(rawText) &&
+     (/\b(card|credit card|debit card|a\/c|acct|account|upi|vpa|ref|slice|amex|hdfc|sbi|icici|axis|kotak|pnb|paytm|gpay|phonepe)\b/i.test(rawText) || hasCurrencyOrAmount)) ||
+    /^(spent|paid|bought|purchased)\s+([$₹€£]?[0-9]+)/i.test(rawText) ||
+    /^(?:coffee|groceries|petrol|fuel|uber|ola|swiggy|zomato|dinner|lunch|breakfast|milk|vegetables|medicine)\s+[$₹€£]?[0-9]+/i.test(rawText)
+  );
+
+  if (isBankSms) {
+    const { tx } = await extractAndLogExpense(c.env, rawText, username);
+    const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+    const sym = symbolMap[tx.currency] || `${tx.currency} `;
+    
+    if (token && chatId) {
+      const reply = 
+        `📱 *Auto-Logged from Phone SMS:*\n` +
+        `• *Item / Vendor:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
+        `• *Amount:* ${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
+        `• *Date:* \`${tx.transaction_date}\`\n` +
+        (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
+        (sender ? `• *Sender:* \`${sender}\`\n` : '');
+      await sendTelegramMessage(token, chatId, reply);
+    }
+    return c.json({ success: true, type: 'expense', tx });
+  }
+
+  // Check if Event / Reminder
+  const isEventStatement = (
+    /^(i attended|attended|went to|visited|had lunch with|had dinner with|had a meeting with|met with|flying to|flight to|booked|participated in)/i.test(rawText) ||
+    /^(today|yesterday|tomorrow)\s+(i|we|there is|there was|i'm|i am)\b/i.test(rawText) ||
+    /^(remind me|reminder|set a reminder|remember to|don't forget|dont forget)\b/i.test(rawText) ||
+    /\b(everyday|every day|daily reminder)\b/i.test(rawText) ||
+    /\b(doctor appointment|dentist appointment|meeting at|sync at|call with)\b/i.test(rawText)
+  );
+
+  if (isEventStatement) {
+    const { events } = await extractAndLogEvent(c.env, rawText, username);
+    if (token && chatId && events && events.length > 0) {
+      const ev = events[0];
+      const reply = 
+        `📱 *Auto-Logged Event from SMS:*\n` +
+        `📌 *${ev.title}* (ID: \`#${ev.id}\`)\n` +
+        `📅 *Date:* \`${ev.event_date}\`\n` +
+        (ev.location ? `📍 *Location:* ${ev.location}\n` : '') +
+        (sender ? `• *Sender:* \`${sender}\`\n` : '');
+      await sendTelegramMessage(token, chatId, reply);
+    }
+    return c.json({ success: true, type: 'event', events });
+  }
+
+  // Otherwise, log as personal note in D1 documents
+  const stmt = c.env.DB.prepare(`
+    INSERT INTO documents (file_path, file_type, file_size_bytes, username, source_name)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  await stmt.bind(`sms/${Date.now()}`, 'text/plain', rawText.length, username, sender || 'Phone SMS').run();
+  
+  if (token && chatId) {
+    await sendTelegramMessage(token, chatId, `📱 *SMS Note Received:*\n_${rawText.slice(0, 300)}_\n${sender ? `• Sender: \`${sender}\`` : ''}`);
+  }
+
+  return c.json({ success: true, type: 'note', text: rawText });
+});
+
 // 1. Events Endpoints
 app.get('/api/v1/events', async (c) => {
   const username = c.req.query('username') || c.env.DEFAULT_USER || 'default_user';
