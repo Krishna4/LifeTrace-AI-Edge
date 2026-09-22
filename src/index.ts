@@ -716,12 +716,35 @@ app.all('/sms/webhook', async (c) => {
   }
 
   // Otherwise, log as personal note in D1 documents
+  const metaObj = { text: rawText, sender, received_at: new Date().toISOString() };
   const stmt = c.env.DB.prepare(`
     INSERT INTO documents (file_path, file_type, file_size_bytes, username, source_name, metadata_json)
     VALUES (?, ?, ?, ?, ?, ?)
   `);
-  await stmt.bind(`sms/${Date.now()}`, 'text/plain', rawText.length, username, sender || 'Phone SMS', JSON.stringify({ text: rawText, sender })).run();
-  
+  const res = await stmt.bind(`sms/${Date.now()}`, 'text/plain', rawText.length, username, sender || 'Phone SMS', JSON.stringify(metaObj)).run();
+  const docId = res.meta.last_row_id;
+
+  try {
+    const textToEmbed = `SMS Message from ${sender || 'Unknown'}: ${rawText}`;
+    const embedRes = await c.env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
+    await c.env.VECTORIZE.upsert([
+      {
+        id: `doc-${docId}`,
+        values: embedRes.data[0],
+        metadata: {
+          type: 'document',
+          id: docId,
+          title: `SMS from ${sender || 'Unknown'}`,
+          sender: sender || 'Unknown',
+          username,
+          text: rawText.slice(0, 1000),
+        },
+      },
+    ]);
+  } catch (err) {
+    console.warn('Vectorize SMS note index warning:', err);
+  }
+
   if (token && chatId) {
     await sendTelegramMessage(token, chatId, `📱 *SMS Note Received:*\n_${rawText.slice(0, 300)}_\n${sender ? `• Sender: \`${sender}\`` : ''}`);
   }
@@ -1026,7 +1049,7 @@ async function executeRagQuery(
   rawQuery: string,
   username: string,
   chatId?: string
-): Promise<{ query: string; answer: string; events: any[]; transactions: any[]; vector_matches: number; sources: string[] }> {
+): Promise<{ query: string; answer: string; events: any[]; transactions: any[]; documents?: any[]; vector_matches: number; sources: string[] }> {
   // Input sanitization: trim and cap length to 500 chars to avoid CPU/neuron exhaustion
   const query = (rawQuery || '').trim().slice(0, 500);
   if (!query) {
@@ -1035,6 +1058,7 @@ async function executeRagQuery(
       answer: 'Please provide a non-empty question.',
       events: [],
       transactions: [],
+      documents: [],
       vector_matches: 0,
       sources: [],
     };
@@ -1046,8 +1070,8 @@ async function executeRagQuery(
     const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [query] });
     const queryVector = embedRes.data[0];
     const vecResults = await env.VECTORIZE.query(queryVector, { topK: 5, returnMetadata: 'all' });
-    // Similarity threshold filtering (score >= 0.55): discard low-relevance noise to prevent hallucination
-    vectorHits = (vecResults.matches || []).filter((hit: any) => (hit.score ?? 0) >= 0.55);
+    // Similarity threshold filtering (score >= 0.60): discard low-relevance noise to prevent hallucination
+    vectorHits = (vecResults.matches || []).filter((hit: any) => (hit.score ?? 0) >= 0.60);
   } catch (err) {
     console.warn('Vector search warning:', err);
   }
@@ -1067,7 +1091,11 @@ async function executeRagQuery(
     }
   }
 
-  // Search personal events via keyword / date
+  // Detect phone numbers or SMS/message query intent
+  const phoneMatch = query.match(/\b\d{6,15}\b/);
+  const isMessageQuery = /\b(message|messages|sms|messes|msg|msgs|text|texts|note|notes)\b/i.test(query);
+
+  // Search personal events via keyword / date / phone
   let matchingEvents: any[] = [];
   try {
     let eventSql = 'SELECT * FROM personal_events WHERE username = ?';
@@ -1076,6 +1104,10 @@ async function executeRagQuery(
     if (targetDate) {
       eventSql += ' AND (event_date = ? OR category = "REMINDER" OR LOWER(title) LIKE "%remind%" OR LOWER(title) LIKE "%daily%" OR LOWER(title) LIKE "%everyday%" OR LOWER(details) LIKE "%daily%" OR LOWER(details) LIKE "%everyday%")';
       eventParams.push(targetDate);
+    } else if (phoneMatch) {
+      eventSql += ' AND (title LIKE ? OR details LIKE ? OR entity_person LIKE ?)';
+      const pTerm = `%${phoneMatch[0]}%`;
+      eventParams.push(pTerm, pTerm, pTerm);
     } else {
       eventSql += ' AND (LOWER(title) LIKE ? OR LOWER(details) LIKE ? OR LOWER(entity_person) LIKE ? OR LOWER(location) LIKE ?)';
       const term = `%${qLower}%`;
@@ -1088,11 +1120,17 @@ async function executeRagQuery(
     console.warn('D1 events query error:', e);
   }
 
-  // Search transactions via entity or general money/expense query
+  // Search transactions via entity or general money/expense query or phone
   let matchingTx: any[] = [];
   const isFinancial = /\b(expense|expenses|spend|spent|spending|bought|buy|purchase|purchases|bill|bills|paid|pay|payment|cost|costs|money|transaction|transactions|finance|financial|ledger|inr|usd|eur|gbp|rs|₹|\$)\b/i.test(query);
   try {
-    if (isFinancial) {
+    if (phoneMatch) {
+      const pTerm = `%${phoneMatch[0]}%`;
+      const { results } = await env.DB.prepare(
+        'SELECT * FROM transactions WHERE username = ? AND (entity_person LIKE ? OR notes LIKE ?) ORDER BY transaction_date DESC, id DESC LIMIT 10'
+      ).bind(username, pTerm, pTerm).all();
+      matchingTx = results || [];
+    } else if (isFinancial) {
       const { results } = await env.DB.prepare(
         'SELECT * FROM transactions WHERE username = ? ORDER BY transaction_date DESC, id DESC LIMIT 15'
       ).bind(username).all();
@@ -1105,6 +1143,39 @@ async function executeRagQuery(
     }
   } catch (e) {
     console.warn('D1 transactions query error:', e);
+  }
+
+  // Search documents & SMS messages in D1
+  let matchingDocs: any[] = [];
+  try {
+    let docSql = 'SELECT id, file_path, source_name, metadata_json, created_at FROM documents WHERE username = ?';
+    const docParams: any[] = [username];
+
+    if (phoneMatch) {
+      docSql += ' AND (source_name LIKE ? OR metadata_json LIKE ?)';
+      const pTerm = `%${phoneMatch[0]}%`;
+      docParams.push(pTerm, pTerm);
+    } else if (isMessageQuery) {
+      const cleanedTerms = query
+        .replace(/\b(show|me|the|all|recent|latest|any|from|about|of|my|messages?|messes|sms|texts?|notes?)\b/gi, ' ')
+        .trim();
+      if (cleanedTerms.length > 1) {
+        docSql += ' AND (LOWER(source_name) LIKE ? OR LOWER(metadata_json) LIKE ?)';
+        const term = `%${cleanedTerms.toLowerCase()}%`;
+        docParams.push(term, term);
+      } else {
+        docSql += ' AND file_path LIKE "sms/%"';
+      }
+    } else {
+      docSql += ' AND (LOWER(source_name) LIKE ? OR LOWER(metadata_json) LIKE ?)';
+      const term = `%${qLower}%`;
+      docParams.push(term, term);
+    }
+    docSql += ' ORDER BY id DESC LIMIT 5';
+    const { results } = await env.DB.prepare(docSql).bind(...docParams).all();
+    matchingDocs = results || [];
+  } catch (e) {
+    console.warn('D1 documents query error:', e);
   }
 
   // C. Assemble Grounded Context for LLM Synthesis
@@ -1130,7 +1201,24 @@ async function executeRagQuery(
     contextParts.push(`Financial Records:\n${matchingTx.map(t => `- [Tx #${t.id}] Paid/received ${t.currency} ${formatAmount(t.amount, t.currency)} (${t.currency}) for/with ${t.entity_person} on ${t.transaction_date}${t.notes ? ` (Notes: ${t.notes})` : ''}`).join('\n')}`);
   }
 
-  // 4. Conversation History (Multi-turn chat memory)
+  // 4. Structured D1 SMS & Document Notes
+  if (matchingDocs.length > 0) {
+    const docTexts = matchingDocs.map(d => {
+      let text = '';
+      let sender = d.source_name || 'Unknown';
+      if (d.metadata_json) {
+        try {
+          const meta = JSON.parse(d.metadata_json);
+          text = meta.text || '';
+          if (meta.sender) sender = meta.sender;
+        } catch {}
+      }
+      return `- [SMS/Note #${d.id}] From sender: "${sender}" received on ${d.created_at}: ${text || '(empty message text)'}`;
+    });
+    contextParts.push(`Saved Phone Messages & Notes:\n${docTexts.join('\n')}`);
+  }
+
+  // 5. Conversation History (Multi-turn chat memory)
   const recentHistory: { role: string; content: string }[] = [];
   if (chatId) {
     try {
@@ -1156,7 +1244,7 @@ async function executeRagQuery(
   const systemPrompt = `You are LifeTrace AI, a knowledgeable, concise, and helpful personal AI assistant and second brain. Today's date is ${todayStr}.
 ${hasPersonalContext ? `\nPersonal Ledger, Notes & Records:\n${contextParts.join('\n\n')}\n` : ''}
 Instructions:
-1. If the user's query asks about their personal life, schedule, expenses, notes, or history:
+1. If the user's query asks about their personal life, schedule, expenses, notes, messages, or history:
    - Use the provided personal context to answer accurately and concisely.
    - If no relevant records exist in their personal context, clearly inform them that you couldn't find any matching records in their ledger or notes.
 2. If the user's query is a GENERAL or GENERIC question (e.g., world knowledge, science, coding, recipes, writing, general advice, explanations, math):
@@ -1190,13 +1278,27 @@ Instructions:
   }
 
   // Fallback if LLM gives empty output or is offline
-  if (!finalAnswer && (matchingEvents.length > 0 || vectorHits.length > 0 || matchingTx.length > 0)) {
+  if (!finalAnswer && (matchingEvents.length > 0 || vectorHits.length > 0 || matchingTx.length > 0 || matchingDocs.length > 0)) {
     const fallbackLines: string[] = [];
     if (matchingEvents.length > 0) {
       fallbackLines.push(`📅 **Events:**\n` + matchingEvents.map(e => `- **[${e.category}] ${e.title}** on ${e.event_date}${e.location ? ` at ${e.location}` : ''}`).join('\n'));
     }
     if (matchingTx.length > 0) {
       fallbackLines.push(`💰 **Transactions:**\n` + matchingTx.map(t => `- **${t.entity_person}:** $${t.amount} ${t.currency} on ${t.transaction_date}`).join('\n'));
+    }
+    if (matchingDocs.length > 0) {
+      fallbackLines.push(`📱 **Messages & Notes:**\n` + matchingDocs.map(d => {
+        let text = '';
+        let sender = d.source_name || 'Unknown';
+        if (d.metadata_json) {
+          try {
+            const meta = JSON.parse(d.metadata_json);
+            text = meta.text || '';
+            if (meta.sender) sender = meta.sender;
+          } catch {}
+        }
+        return `• **[#${d.id}] From ${sender}:** ${text || '(no content)'} (${d.created_at})`;
+      }).join('\n'));
     }
     if (fallbackLines.length === 0 && vectorHits.length > 0) {
       const validSnippets = vectorHits.filter((h: any) => h.metadata?.text).map((h: any) => `• ${h.metadata.text}`);
@@ -1215,12 +1317,18 @@ Instructions:
   for (const t of matchingTx) {
     sourceTags.push(`Tx #${t.id} (${t.entity_person})`);
   }
-  for (const hit of vectorHits) {
-    if (hit.metadata?.type === 'document' && hit.metadata?.title) {
-      sourceTags.push(`Doc: ${hit.metadata.title}`);
-    } else if (hit.metadata?.id) {
-      const typeLabel = hit.metadata?.type === 'transaction' ? 'Tx' : 'Event';
-      sourceTags.push(`${typeLabel} #${hit.metadata.id}`);
+  for (const d of matchingDocs) {
+    sourceTags.push(`SMS #${d.id} (${d.source_name || 'Note'})`);
+  }
+  // Only include vectorHits citations if no explicit relational matches were found, or if score is high
+  if (sourceTags.length === 0) {
+    for (const hit of vectorHits) {
+      if (hit.metadata?.type === 'document' && hit.metadata?.title) {
+        sourceTags.push(`Doc: ${hit.metadata.title}`);
+      } else if (hit.metadata?.id) {
+        const typeLabel = hit.metadata?.type === 'transaction' ? 'Tx' : 'Event';
+        sourceTags.push(`${typeLabel} #${hit.metadata.id}`);
+      }
     }
   }
   const uniqueSources = [...new Set(sourceTags)];
@@ -1253,6 +1361,7 @@ Instructions:
     answer: finalAnswer,
     events: matchingEvents,
     transactions: matchingTx,
+    documents: matchingDocs,
     vector_matches: vectorHits.length,
     sources: uniqueSources,
   };
