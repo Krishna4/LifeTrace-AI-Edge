@@ -1502,10 +1502,10 @@ app.post('/telegram/webhook', async (c) => {
   // /events: View recent events
   if (cmd === '/events') {
     const { results } = await c.env.DB.prepare(
-      'SELECT * FROM personal_events WHERE username = ? ORDER BY event_date DESC LIMIT 5'
+      'SELECT * FROM personal_events WHERE username = ? ORDER BY id DESC LIMIT 10'
     ).bind(username).all();
     const lines = (results || []).map((e: any) => `• (ID: \`#${e.id}\`) *[${e.category}]* ${e.title} (${e.event_date})`);
-    const reply = lines.length ? `📅 *Recent Events:*\n${lines.join('\n')}\n\n_Tip: Type /delete <id> to remove an entry._` : 'No events found.';
+    const reply = lines.length ? `📅 *Recent Events (Latest 10):*\n${lines.join('\n')}\n\n_Tip: Type /delete <id> to remove an entry._` : 'No events found.';
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
@@ -1513,14 +1513,14 @@ app.post('/telegram/webhook', async (c) => {
   // /expenses: View recent expenses
   if (cmd === '/expenses') {
     const { results } = await c.env.DB.prepare(
-      'SELECT * FROM transactions WHERE username = ? ORDER BY transaction_date DESC, id DESC LIMIT 5'
+      'SELECT * FROM transactions WHERE username = ? ORDER BY id DESC LIMIT 10'
     ).bind(username).all();
     const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
     const lines = (results || []).map((t: any) => {
       const sym = symbolMap[t.currency] || `${t.currency} `;
       return `• (ID: \`#${t.id}\`) *${t.entity_person}:* ${sym}${formatAmount(t.amount, t.currency)} (${t.currency}) on \`${t.transaction_date}\``;
     });
-    const reply = lines.length ? `💰 *Recent Transactions:*\n${lines.join('\n')}\n\n_Tip: Type /delete_expense <id> to remove an entry._` : 'No transactions found.';
+    const reply = lines.length ? `💰 *Recent Transactions (Latest 10):*\n${lines.join('\n')}\n\n_Tip: Type /delete_expense <id> to remove an entry._` : 'No transactions found.';
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
