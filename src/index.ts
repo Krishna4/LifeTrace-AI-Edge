@@ -482,28 +482,12 @@ function parseSmsDate(text: string): string | null {
 
 function isFinancialSmsOrSpend(text: string): boolean {
   const trimmed = text.trim();
-  
-  // Transaction action keywords: spent, debited, sent, paid, transferred, charged, withdrawn, etc.
-  const hasActionKeyword = /\b(spent|debited|debit|charged|paid|sent|transferred|transfer|withdrawn|deducted|remitted)\b/i.test(trimmed);
-  // Bank / Account / Payment / Card markers:
-  const hasBankMarker = /\b(card|credit card|debit card|a\/c|acct|account|upi|vpa|ref|slice|amex|hdfc|sbi|icici|axis|kotak|pnb|paytm|gpay|phonepe|bank|neft|imps|rtgs)\b/i.test(trimmed);
-  // Currency amounts:
-  const hasCurrencyOrAmount = /(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$))/i.test(trimmed);
+  const hasMoney = /(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$))/i.test(trimmed);
+  if (!hasMoney) return false;
 
-  // If message has banking action keywords + (bank markers OR amount), or matches common spend formats
-  const isBankAlert = (hasActionKeyword && (hasBankMarker || hasCurrencyOrAmount)) ||
-    /^(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$)).*?\b(spent|debited|sent|paid|transferred|charged)\b/i.test(trimmed) ||
-    /^(spent|paid|bought|purchased|sent|debited)\s+([$₹€£]?[0-9]+)/i.test(trimmed) ||
-    /^(?:coffee|groceries|petrol|fuel|uber|ola|swiggy|zomato|dinner|lunch|breakfast|milk|vegetables|medicine)\s+[$₹€£]?[0-9]+/i.test(trimmed);
-
-  if (isBankAlert) {
-    // Only treat as a user question if the user is explicitly inquiring e.g. "Did I spend Rs. 500?" or "Show me what was sent"
-    const isUserQuery = /^(what|who|when|where|why|how|is|are|did|can|could|do|does|will|show|list|summarize|tell me|give me|check|find)\b/i.test(trimmed);
-    if (!isUserQuery) {
-      return true;
-    }
-  }
-  return false;
+  // Route to RAG search only if user is explicitly querying about transactions
+  const isUserQuery = /^(what|show|list|how|why|when|where|who|did|is|are|check|can|could|tell me|give me|find)\b/i.test(trimmed);
+  return !isUserQuery;
 }
 
 async function extractAndLogExpense(
