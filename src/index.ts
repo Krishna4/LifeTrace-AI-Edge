@@ -462,6 +462,50 @@ function parseAmountAndCurrency(rawText: string): { amount: number | null; curre
   return { amount: null, currency, isCurrencyAnchored: false };
 }
 
+function parseSmsDate(text: string): string | null {
+  const monthMap: Record<string, string> = {
+    jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+    jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
+  };
+  const dMatch = text.match(/\b([0-3]?[0-9])-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-([0-9]{2,4})\b/i);
+  if (dMatch) {
+    const day = dMatch[1].padStart(2, '0');
+    const month = monthMap[dMatch[2].toLowerCase()];
+    let year = dMatch[3];
+    if (year.length === 2) year = '20' + year;
+    return `${year}-${month}-${day}`;
+  }
+  const isoMatch = text.match(/\b(20\d{2})-(0[1-9]|1[0-2])-([0-3][0-9])\b/);
+  if (isoMatch) return isoMatch[0];
+  return null;
+}
+
+function isFinancialSmsOrSpend(text: string): boolean {
+  const trimmed = text.trim();
+  
+  // Transaction action keywords: spent, debited, sent, paid, transferred, charged, withdrawn, etc.
+  const hasActionKeyword = /\b(spent|debited|debit|charged|paid|sent|transferred|transfer|withdrawn|deducted|remitted)\b/i.test(trimmed);
+  // Bank / Account / Payment / Card markers:
+  const hasBankMarker = /\b(card|credit card|debit card|a\/c|acct|account|upi|vpa|ref|slice|amex|hdfc|sbi|icici|axis|kotak|pnb|paytm|gpay|phonepe|bank|neft|imps|rtgs)\b/i.test(trimmed);
+  // Currency amounts:
+  const hasCurrencyOrAmount = /(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$))/i.test(trimmed);
+
+  // If message has banking action keywords + (bank markers OR amount), or matches common spend formats
+  const isBankAlert = (hasActionKeyword && (hasBankMarker || hasCurrencyOrAmount)) ||
+    /^(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$)).*?\b(spent|debited|sent|paid|transferred|charged)\b/i.test(trimmed) ||
+    /^(spent|paid|bought|purchased|sent|debited)\s+([$₹€£]?[0-9]+)/i.test(trimmed) ||
+    /^(?:coffee|groceries|petrol|fuel|uber|ola|swiggy|zomato|dinner|lunch|breakfast|milk|vegetables|medicine)\s+[$₹€£]?[0-9]+/i.test(trimmed);
+
+  if (isBankAlert) {
+    // Only treat as a user question if the user is explicitly inquiring e.g. "Did I spend Rs. 500?" or "Show me what was sent"
+    const isUserQuery = /^(what|who|when|where|why|how|is|are|did|can|could|do|does|will|show|list|summarize|tell me|give me|check|find)\b/i.test(trimmed);
+    if (!isUserQuery) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function extractAndLogExpense(
   env: Env,
   rawText: string,
@@ -474,6 +518,18 @@ async function extractAndLogExpense(
   const regexResult = parseAmountAndCurrency(rawText);
   let regexEntity = 'General Expense';
   let regexNotes = rawText.trim();
+
+  // Fast deterministic recipient/merchant extraction:
+  // e.g. "to KUNCHALA BRAHMAIAH", "to KONDA VEEETI PAVANI", "at Ramreddy chicken market", "at G R T JEWELL"
+  const toMatch = rawText.match(/\bto\s+([A-Z][A-Za-z0-9\s]{2,40}?)(?:\s*\(|\s+on\s+|\s+via\s+|\s+ref|\s+upi|\.|$)/i);
+  const atMatch = rawText.match(/\bat\s+([A-Z][A-Za-z0-9\s]{2,40}?)(?:\s*\(|\s+on\s+|\s+via\s+|\s+ref|\s+upi|\.|$)/i);
+  if (toMatch && toMatch[1] && !/^(a\/c|account|card)\b/i.test(toMatch[1].trim())) {
+    regexEntity = toMatch[1].trim();
+  } else if (atMatch && atMatch[1]) {
+    regexEntity = atMatch[1].trim();
+  }
+
+  const smsDate = parseSmsDate(rawText);
 
   // Strip common bank SMS noise, currency symbols, and amount to get fallback entity
   const stripped = rawText
@@ -567,7 +623,7 @@ Return ONLY valid JSON without markdown code fences:`,
   const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
   const txDate = (parsed?.transaction_date && typeof parsed.transaction_date === 'string' && dateRegex.test(parsed.transaction_date))
     ? parsed.transaction_date
-    : todayStr;
+    : (smsDate || todayStr);
 
   const notes = parsed?.notes || regexNotes || rawText;
 
@@ -665,13 +721,7 @@ app.all('/sms/webhook', async (c) => {
   const chatId = c.env.TELEGRAM_CHAT_ID;
 
   // Intelligent Classification: Expense vs Event vs Note
-  const hasCurrencyOrAmount = /(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$))/i.test(rawText);
-  const isBankSms = (
-    (/\b(spent|debited|debited by|charged|paid to|sent to|withdrawn|transaction of)\b/i.test(rawText) &&
-     (/\b(card|credit card|debit card|a\/c|acct|account|upi|vpa|ref|slice|amex|hdfc|sbi|icici|axis|kotak|pnb|paytm|gpay|phonepe)\b/i.test(rawText) || hasCurrencyOrAmount)) ||
-    /^(spent|paid|bought|purchased)\s+([$₹€£]?[0-9]+)/i.test(rawText) ||
-    /^(?:coffee|groceries|petrol|fuel|uber|ola|swiggy|zomato|dinner|lunch|breakfast|milk|vegetables|medicine)\s+[$₹€£]?[0-9]+/i.test(rawText)
-  );
+  const isBankSms = isFinancialSmsOrSpend(rawText);
 
   if (isBankSms) {
     const { tx } = await extractAndLogExpense(c.env, rawText, username);
@@ -1635,19 +1685,9 @@ app.post('/telegram/webhook', async (c) => {
   // 3. A Question / Search query (routes to RAG)
 
   const trimmedText = text.trim();
-  const isQuestion = trimmedText.endsWith('?') || /^(what|who|when|where|why|how|is|are|did|can|could|do|does|will|show|list|summarize|tell me|give me|check|find)\b/i.test(trimmedText);
 
   // 1. Automatic Financial Transaction / Bank SMS Detection
-  const hasCurrencyOrAmount = /(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$))/i.test(trimmedText);
-  const isBankSms = !isQuestion && (
-    // Bank & Card SMS keywords: spent/debited/charged/transferred along with bank/card/account/ref/UPI markers
-    (/\b(spent|debited|debited by|charged|paid to|sent to|withdrawn|transaction of)\b/i.test(trimmedText) &&
-     (/\b(card|credit card|debit card|a\/c|acct|account|upi|vpa|ref|slice|amex|hdfc|sbi|icici|axis|kotak|pnb|paytm|gpay|phonepe)\b/i.test(trimmedText) || hasCurrencyOrAmount)) ||
-    // Starts with "Spent", "Paid", "Bought", "Purchased" followed by currency/amount
-    /^(spent|paid|bought|purchased)\s+([$₹€£]?[0-9]+)/i.test(trimmedText) ||
-    // Raw spend format e.g. "coffee 4.50", "petrol 2000 inr", "groceries $50"
-    /^(?:coffee|groceries|petrol|fuel|uber|ola|swiggy|zomato|dinner|lunch|breakfast|milk|vegetables|medicine)\s+[$₹€£]?[0-9]+/i.test(trimmedText)
-  );
+  const isBankSms = isFinancialSmsOrSpend(trimmedText);
 
   if (isBankSms) {
     const { tx } = await extractAndLogExpense(c.env, trimmedText, username);
@@ -1665,6 +1705,7 @@ app.post('/telegram/webhook', async (c) => {
   }
 
   // 2. Automatic Event / Reminder / Life Log Detection
+  const isQuestion = trimmedText.endsWith('?') || /^(what|who|when|where|why|how|is|are|did|can|could|do|does|will|show|list|summarize|tell me|give me|check|find)\b/i.test(trimmedText);
   const isEventStatement = !isQuestion && (
     /^(i attended|attended|went to|visited|had lunch with|had dinner with|had a meeting with|met with|flying to|flight to|booked|participated in)/i.test(trimmedText) ||
     /^(today|yesterday|tomorrow)\s+(i|we|there is|there was|i'm|i am)\b/i.test(trimmedText) ||
