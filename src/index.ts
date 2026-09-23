@@ -48,6 +48,124 @@ function getTodayDateStr(timezone?: string): string {
   }
 }
 
+interface ExpensePeriodQuery {
+  startDate?: string;
+  endDate?: string;
+  keyword?: string;
+  limit: number;
+  label: string;
+}
+
+function parseExpensePeriod(args: string, userTimezone: string = 'Asia/Kolkata'): ExpensePeriodQuery {
+  const trimmed = (args || '').trim().toLowerCase();
+  const todayStr = getTodayDateStr(userTimezone);
+  const [yearStr, monthStr] = todayStr.split('-');
+  const year = parseInt(yearStr, 10);
+  const month = parseInt(monthStr, 10);
+
+  if (!trimmed) {
+    return { limit: 5, label: 'Recent (Latest 5)' };
+  }
+
+  // Pure number limit e.g. "10", "20", "50"
+  if (/^\d+$/.test(trimmed)) {
+    const lim = Math.min(100, Math.max(1, parseInt(trimmed, 10)));
+    return { limit: lim, label: `Recent (Latest ${lim})` };
+  }
+
+  // Today
+  if (trimmed === 'today') {
+    return { startDate: todayStr, endDate: todayStr, limit: 100, label: `Today (${todayStr})` };
+  }
+
+  // Yesterday
+  if (trimmed === 'yesterday') {
+    const d = new Date(`${todayStr}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - 1);
+    const yestStr = d.toISOString().split('T')[0];
+    return { startDate: yestStr, endDate: yestStr, limit: 100, label: `Yesterday (${yestStr})` };
+  }
+
+  // Last N days e.g. "7d", "30d", "14d", "7 days"
+  const daysMatch = trimmed.match(/^(\d+)\s*(?:d|days?)$/);
+  if (daysMatch) {
+    const days = parseInt(daysMatch[1], 10);
+    const d = new Date(`${todayStr}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - (days - 1));
+    const startStr = d.toISOString().split('T')[0];
+    return { startDate: startStr, endDate: todayStr, limit: 100, label: `Last ${days} Days (${startStr} to ${todayStr})` };
+  }
+
+  // This month
+  if (trimmed === 'this month' || trimmed === 'thismonth') {
+    const startStr = `${yearStr}-${monthStr}-01`;
+    return { startDate: startStr, endDate: todayStr, limit: 100, label: `This Month (${yearStr}-${monthStr})` };
+  }
+
+  // Last month
+  if (trimmed === 'last month' || trimmed === 'lastmonth') {
+    const prevMonthDate = new Date(Date.UTC(year, month - 2, 1));
+    const prevYear = prevMonthDate.getUTCFullYear();
+    const prevMonth = String(prevMonthDate.getUTCMonth() + 1).padStart(2, '0');
+    const lastDay = new Date(Date.UTC(year, month - 1, 0)).getUTCDate();
+    const startStr = `${prevYear}-${prevMonth}-01`;
+    const endStr = `${prevYear}-${prevMonth}-${String(lastDay).padStart(2, '0')}`;
+    return { startDate: startStr, endDate: endStr, limit: 100, label: `Last Month (${prevYear}-${prevMonth})` };
+  }
+
+  // Specific ISO date e.g. "2026-09-17"
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return { startDate: trimmed, endDate: trimmed, limit: 100, label: `on ${trimmed}` };
+  }
+
+  // Specific ISO month e.g. "2026-09"
+  if (/^\d{4}-\d{2}$/.test(trimmed)) {
+    const [y, m] = trimmed.split('-');
+    const lastDay = new Date(Date.UTC(parseInt(y, 10), parseInt(m, 10), 0)).getUTCDate();
+    const startStr = `${trimmed}-01`;
+    const endStr = `${trimmed}-${String(lastDay).padStart(2, '0')}`;
+    return { startDate: startStr, endDate: endStr, limit: 100, label: `in ${trimmed}` };
+  }
+
+  // Date range e.g. "2026-09-15 2026-09-23" or "2026-09-15 to 2026-09-23" or "2026-09-15 - 2026-09-23"
+  const rangeMatch = trimmed.match(/^(\d{4}-\d{2}-\d{2})\s*(?:to|-|\s)\s*(\d{4}-\d{2}-\d{2})$/);
+  if (rangeMatch) {
+    const s = rangeMatch[1];
+    const e = rangeMatch[2];
+    return { startDate: s, endDate: e, limit: 100, label: `from ${s} to ${e}` };
+  }
+
+  // Month names e.g. "september", "sep 2026", "sept", "august"
+  const monthNames: Record<string, number> = {
+    jan: 1, january: 1,
+    feb: 2, february: 2,
+    mar: 3, march: 3,
+    apr: 4, april: 4,
+    may: 5,
+    jun: 6, june: 6,
+    jul: 7, july: 7,
+    aug: 8, august: 8,
+    sep: 9, sept: 9, september: 9,
+    oct: 10, october: 10,
+    nov: 11, november: 11,
+    dec: 12, december: 12
+  };
+
+  const monthWordMatch = trimmed.match(/^([a-z]+)(?:\s+(\d{4}))?$/);
+  if (monthWordMatch && monthNames[monthWordMatch[1]]) {
+    const mNum = monthNames[monthWordMatch[1]];
+    const yNum = monthWordMatch[2] ? parseInt(monthWordMatch[2], 10) : year;
+    const mStr = String(mNum).padStart(2, '0');
+    const lastDay = new Date(Date.UTC(yNum, mNum, 0)).getUTCDate();
+    const startStr = `${yNum}-${mStr}-01`;
+    const endStr = `${yNum}-${mStr}-${String(lastDay).padStart(2, '0')}`;
+    return { startDate: startStr, endDate: endStr, limit: 100, label: `in ${monthWordMatch[1]} ${yNum}` };
+  }
+
+  // Fallback: Keyword search (vendor/note match)
+  return { keyword: trimmed, limit: 20, label: `Matching "${args.trim()}"` };
+}
+
 async function sendTelegramMessage(token: string, chatId: string, text: string, parseMode?: string) {
   const mode = parseMode === undefined ? 'Markdown' : parseMode;
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
@@ -908,6 +1026,9 @@ app.post('/api/v1/events', async (c) => {
 app.get('/api/v1/transactions', async (c) => {
   const username = c.req.query('username') || c.env.DEFAULT_USER || 'default_user';
   const entity = c.req.query('entity_person');
+  const startDate = c.req.query('start_date');
+  const endDate = c.req.query('end_date');
+  const month = c.req.query('month');
   const limit = Number(c.req.query('limit')) || 50;
 
   let sql = 'SELECT * FROM transactions WHERE username = ?';
@@ -916,6 +1037,18 @@ app.get('/api/v1/transactions', async (c) => {
   if (entity) {
     sql += ' AND LOWER(entity_person) LIKE ?';
     params.push(`%${entity.toLowerCase()}%`);
+  }
+  if (startDate) {
+    sql += ' AND transaction_date >= ?';
+    params.push(startDate);
+  }
+  if (endDate) {
+    sql += ' AND transaction_date <= ?';
+    params.push(endDate);
+  }
+  if (month && /^\d{4}-\d{2}$/.test(month)) {
+    sql += ' AND transaction_date LIKE ?';
+    params.push(`${month}-%`);
   }
 
   sql += ' ORDER BY transaction_date DESC, id DESC LIMIT ?';
@@ -1463,7 +1596,7 @@ app.post('/telegram/webhook', async (c) => {
       `• \`/today\` or \`/digest\` — View today's agenda & expenses\n` +
       `• \`/today YYYY-MM-DD\` — View agenda for a specific date\n` +
       `• \`/events\` — List recent life events\n` +
-      `• \`/expenses\` — List recent financial transactions\n\n` +
+      `• \`/expenses [period]\` — List transactions (e.g. \`/expenses\`, \`/expenses 2026-09\`, \`/expenses 7d\`, \`/expenses 2026-09-17\`, \`/expenses <vendor>\`)\n\n` +
       `✍️ *Log Events & Transactions:*\n` +
       `• \`/log <details>\` — Log an event (e.g. \`/log AI workshop at office 10am\`)\n` +
       `• \`/spend <amount> <description>\` — Log an expense (e.g. \`/spend 50 groceries\`, \`/spend $20 lunch\`, \`/spend 500 INR petrol\`)\n\n` +
@@ -1510,17 +1643,58 @@ app.post('/telegram/webhook', async (c) => {
     return c.json({ ok: true });
   }
 
-  // /expenses: View recent expenses
+  // /expenses: View expenses with period, date range, or keyword filtering
   if (cmd === '/expenses') {
-    const { results } = await c.env.DB.prepare(
-      'SELECT * FROM transactions WHERE username = ? ORDER BY transaction_date DESC, id DESC LIMIT 5'
-    ).bind(username).all();
+    const period = parseExpensePeriod(args, c.env.USER_TIMEZONE);
+    let sql = 'SELECT * FROM transactions WHERE username = ?';
+    const params: any[] = [username];
+
+    if (period.startDate && period.endDate) {
+      if (period.startDate === period.endDate) {
+        sql += ' AND transaction_date = ?';
+        params.push(period.startDate);
+      } else {
+        sql += ' AND transaction_date >= ? AND transaction_date <= ?';
+        params.push(period.startDate, period.endDate);
+      }
+    } else if (period.keyword) {
+      sql += ' AND (LOWER(entity_person) LIKE ? OR LOWER(notes) LIKE ?)';
+      params.push(`%${period.keyword}%`, `%${period.keyword}%`);
+    }
+
+    sql += ' ORDER BY transaction_date DESC, id DESC LIMIT ?';
+    params.push(period.limit);
+
+    const { results } = await c.env.DB.prepare(sql).bind(...params).all();
+    const txList = (results || []) as any[];
+
     const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
-    const lines = (results || []).map((t: any) => {
+    const lines = txList.map((t: any) => {
       const sym = symbolMap[t.currency] || `${t.currency} `;
       return `• (ID: \`#${t.id}\`) *${t.entity_person}:* ${sym}${formatAmount(t.amount, t.currency)} (${t.currency}) on \`${t.transaction_date}\``;
     });
-    const reply = lines.length ? `💰 *Recent Transactions:*\n${lines.join('\n')}\n\n_Tip: Type /delete_expense <id> to remove an entry._` : 'No transactions found.';
+
+    let summaryTotal = '';
+    if (txList.length > 0) {
+      const totalsByCurrency: Record<string, number> = {};
+      for (const t of txList) {
+        const curr = t.currency || 'INR';
+        totalsByCurrency[curr] = (totalsByCurrency[curr] || 0) + (Number(t.amount) || 0);
+      }
+      const sumStrings = Object.entries(totalsByCurrency).map(([curr, sum]) => {
+        const sym = symbolMap[curr] || `${curr} `;
+        return `${sym}${formatAmount(sum, curr)} (${curr})`;
+      });
+      summaryTotal = `\n\n💵 *Total:* ${sumStrings.join(', ')} (${txList.length} transaction${txList.length === 1 ? '' : 's'})`;
+    }
+
+    let reply = '';
+    if (lines.length > 0) {
+      reply = `💰 *Transactions ${period.label}:*\n${lines.join('\n')}${summaryTotal}\n\n_Tip: Type /delete_expense <id> to remove an entry._`;
+    } else {
+      reply = `💰 No transactions found ${period.label}.\n\n_Tip: Filter by date or period e.g. \`/expenses 2026-09\`, \`/expenses 7d\`, \`/expenses 2026-09-17\`, or \`/expenses\` for latest._`;
+    }
+
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
