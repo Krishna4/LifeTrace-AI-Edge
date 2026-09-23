@@ -541,7 +541,9 @@ async function extractAndLogExpense(
     .replace(/\s+/g, ' ')
     .trim();
   if (stripped) {
-    regexEntity = stripped.slice(0, 80);
+    if (regexEntity === 'General Expense') {
+      regexEntity = stripped.slice(0, 80);
+    }
     regexNotes = stripped;
   }
 
@@ -554,11 +556,11 @@ async function extractAndLogExpense(
           content: `You are a financial transaction extraction assistant. Today's date is ${todayStr}.
 Analyze the user message (which may be a bank SMS alert, credit card notification, or simple spend note) and extract into a single JSON object with this schema:
 {
-  "entity_person": "Vendor, merchant, store, or category (e.g. Ramreddy chicken market, G R T JEWELL, Starbucks, Amazon, Groceries)",
+  "entity_person": "Vendor, merchant, store, recipient, or person (e.g. if 'sent to <Name>', use <Name>; or Ramreddy chicken market, Starbucks, Amazon)",
   "amount": number (The actual currency amount in RUPEES or DOLLARS, NOT in paise or cents! E.g. For 'Rs. 190', amount MUST BE 190, NEVER 19000. Do NOT multiply by 100. Do NOT use card numbers, account numbers, UPI reference numbers, phone numbers, or dates as amount),
   "currency": "USD" | "INR" | "EUR" | "GBP",
-  "transaction_date": "YYYY-MM-DD (resolve words like yesterday, or dates in SMS like 21-Sep-26 into YYYY-MM-DD. Never return relative strings like '-1 month')",
-  "notes": "card info, bank name, reference or short description"
+  "transaction_date": "YYYY-MM-DD (resolve dates in SMS like 23-Sep-26 or 17-Sep-26 into YYYY-MM-DD e.g. 2026-09-23)",
+  "notes": "card/account info, bank name, reference or short description"
 }
 Return ONLY valid JSON without markdown code fences:`,
         },
