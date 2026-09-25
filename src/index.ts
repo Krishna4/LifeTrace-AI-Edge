@@ -346,13 +346,28 @@ function formatEventsForDigest(
     output += `🗓️ *Upcoming in Next 3 Days:*\n${upBlocks.join('\n')}\n\n`;
   }
 
-  // 4. Today's Expenses
+  // 4. Today's Financial Activity
   if (todayExpenses.length > 0) {
-    const expenseLines = todayExpenses.map((tx) => {
+    let dayCredits = 0;
+    let dayDebits = 0;
+    let curr = 'INR';
+    const txLines = todayExpenses.map((tx) => {
       const sym = symbolMap[tx.currency] || `${tx.currency} `;
-      return `• (ID: \`#${tx.id}\`) *${tx.entity_person}:* ${sym}${tx.amount} (${tx.currency})${tx.notes && tx.notes !== tx.entity_person ? ` — _${tx.notes}_` : ''}`;
+      if (tx.currency) curr = tx.currency;
+      const isCredit = tx.tx_type === 'CREDIT';
+      const icon = isCredit ? '🟢' : '🔴';
+      const sign = isCredit ? '+' : '-';
+      const amt = Number(tx.amount) || 0;
+      if (isCredit) dayCredits += amt;
+      else dayDebits += amt;
+      return `• ${icon} (ID: \`#${tx.id}\`) *${tx.entity_person}:* ${sign}${sym}${formatAmount(amt, tx.currency)}${tx.notes && tx.notes !== tx.entity_person ? ` — _${tx.notes}_` : ''}`;
     });
-    output += `💰 *Today's Expenses (${todayExpenses.length}):*\n${expenseLines.join('\n')}\n\n`;
+    const sym = symbolMap[curr] || `${curr} `;
+    const net = dayCredits - dayDebits;
+    const netSign = net >= 0 ? '+' : '-';
+    output += `💰 *Today's Financial Activity (${todayExpenses.length}):*\n` +
+      `🟢 Inflow: +${sym}${formatAmount(dayCredits, curr)} | 🔴 Outflow: -${sym}${formatAmount(dayDebits, curr)} | 💵 Net: ${netSign}${sym}${formatAmount(Math.abs(net), curr)}\n` +
+      `${txLines.join('\n')}\n\n`;
   }
 
   output += `_Reply to ask questions, log new activities, or manage entries!_`;
@@ -656,19 +671,22 @@ async function extractAndLogExpense(
         {
           role: 'system',
           content: `You are a financial transaction extraction assistant. Today's date is ${todayStr}.
-Analyze the user message (which may be a bank SMS alert, credit card notification, or simple spend note) and extract into a single JSON object with this schema:
+Analyze the user message (which may be a bank SMS alert, credit card notification, UPI alert, income or spend note) and extract into a single JSON object with this schema:
 {
-  "entity_person": "Vendor, merchant, store, recipient, or person (e.g. if 'sent to <Name>', use <Name>; or Ramreddy chicken market, Starbucks, Amazon)",
-  "amount": number (The actual currency amount in RUPEES or DOLLARS, NOT in paise or cents! E.g. For 'Rs. 190', amount MUST BE 190, NEVER 19000. Do NOT multiply by 100. Do NOT use card numbers, account numbers, UPI reference numbers, phone numbers, or dates as amount),
-  "currency": "USD" | "INR" | "EUR" | "GBP",
-  "transaction_date": "YYYY-MM-DD (resolve dates in SMS like 23-Sep-26 or 17-Sep-26 into YYYY-MM-DD e.g. 2026-09-23)",
-  "notes": "card/account info, bank name, reference or short description"
+  "tx_type": "DEBIT" | "CREDIT" (Use "CREDIT" if money was received, credited, deposited, refunded, salary, cashback, or added; Use "DEBIT" if money was spent, sent, paid, debited, charged, withdrawn, or expense),
+  "entity_person": "Sender/Payer if Credit (e.g. Employer, Client name, Person, Refund source); or Merchant/Recipient if Debit (e.g. Swiggy, Amazon, Person name, Grocery)",
+  "amount": number (The actual currency amount in RUPEES or DOLLARS, NOT in paise or cents! E.g. For 'Rs. 190', amount MUST BE 190, NEVER 19000. Do NOT multiply by 100. Do NOT use account numbers, card numbers, UPI reference numbers, or dates as amount),
+  "currency": "INR" | "USD" | "EUR" | "GBP",
+  "transaction_date": "YYYY-MM-DD (resolve dates in SMS like 23-Sep-26 or 17-Sep-26 into YYYY-MM-DD)",
+  "account": "Card or account identifier if mentioned (e.g. 'a/c xx7663', 'SBI Card', or null)",
+  "balance": number | null (Available or updated account balance if stated in the message e.g. from 'Avail Bal: Rs 1,45,230', otherwise null),
+  "notes": "Bank name, UPI reference number, payment mode, or short description"
 }
 Return ONLY valid JSON without markdown code fences:`,
         },
         { role: 'user', content: rawText },
       ],
-      max_tokens: 300,
+      max_tokens: 350,
       temperature: 0.1,
     });
 
@@ -687,6 +705,15 @@ Return ONLY valid JSON without markdown code fences:`,
     console.warn('AI expense extraction warning:', err);
   }
 
+  // Determine Transaction Direction (DEBIT vs CREDIT)
+  let txType = 'DEBIT';
+  if (parsed?.tx_type === 'CREDIT' || parsed?.tx_type === 'DEBIT') {
+    txType = parsed.tx_type;
+  } else {
+    const isCredit = /\b(credited|credit|received|deposited|deposit|refund|refunded|cashback|salary|added)\b/i.test(rawText);
+    txType = isCredit ? 'CREDIT' : 'DEBIT';
+  }
+
   // Parse AI amount cleanly: handle numbers or string with commas (e.g. "2,00,000.00" or 200000)
   let aiAmount: number | null = null;
   if (parsed?.amount !== undefined && parsed?.amount !== null) {
@@ -698,9 +725,6 @@ Return ONLY valid JSON without markdown code fences:`,
   }
 
   // Determine final amount:
-  // If regex found an explicit currency-anchored amount (e.g. "Rs. 190", "INR 2,00,000.00", "₹1,500", "$50.25"),
-  // that directly attached number is our ground truth.
-  // This completely eliminates LLM hallucinations (such as converting rupees to paise: 190 -> 19000).
   let finalAmount = 0;
   if (regexResult.isCurrencyAnchored && regexResult.amount !== null && regexResult.amount > 0) {
     finalAmount = regexResult.amount;
@@ -714,14 +738,36 @@ Return ONLY valid JSON without markdown code fences:`,
     finalAmount = regexResult.amount;
   }
 
+  // Extract account identifier
+  let account: string | null = parsed?.account && typeof parsed.account === 'string' ? parsed.account.trim() : null;
+  if (!account) {
+    const accMatch = rawText.match(/\b(?:a\/c|acct|account|card)\s*(?:no\.?)?\s*([xX0-9]{3,16})\b/i);
+    if (accMatch) account = accMatch[0].trim();
+  }
+
+  // Extract available balance if reported
+  let balance: number | null = null;
+  if (parsed?.balance !== undefined && parsed?.balance !== null) {
+    const bVal = parseFloat(String(parsed.balance).replace(/,/g, ''));
+    if (!isNaN(bVal) && bVal >= 0) balance = bVal;
+  }
+  if (balance === null) {
+    const balMatch = rawText.match(/\b(?:avail(?:able)?\s*bal(?:ance)?|avl\s*bal|bal)[:\s]*(?:inr|rs\.?|₹)?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/i);
+    if (balMatch && balMatch[1]) {
+      const bVal = parseFloat(balMatch[1].replace(/,/g, ''));
+      if (!isNaN(bVal) && bVal >= 0) balance = bVal;
+    }
+  }
+
+  const defaultEntity = txType === 'CREDIT' ? 'General Income' : 'General Expense';
   const entity = (parsed?.entity_person && typeof parsed.entity_person === 'string' && parsed.entity_person !== 'General Expense' && parsed.entity_person.trim().length > 0)
     ? parsed.entity_person.trim()
-    : regexEntity;
+    : (regexEntity !== 'General Expense' ? regexEntity : defaultEntity);
 
-  let currency = (parsed?.currency || regexResult.currency || 'USD').toUpperCase();
+  let currency = (parsed?.currency || regexResult.currency || 'INR').toUpperCase();
   if (currency === 'RS' || currency === 'RS.') currency = 'INR';
   if (!['USD', 'INR', 'EUR', 'GBP', 'CAD', 'AUD', 'SGD'].includes(currency)) {
-    currency = regexResult.currency || 'USD';
+    currency = regexResult.currency || 'INR';
   }
 
   const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
@@ -732,14 +778,15 @@ Return ONLY valid JSON without markdown code fences:`,
   const notes = parsed?.notes || regexNotes || rawText;
 
   const stmt = env.DB.prepare(`
-    INSERT INTO transactions (entity_person, amount, currency, transaction_date, notes, username)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO transactions (tx_type, entity_person, amount, currency, transaction_date, account, balance, notes, username)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const res = await stmt.bind(entity, finalAmount, currency, txDate, notes, username).run();
+  const res = await stmt.bind(txType, entity, finalAmount, currency, txDate, account, balance, notes, username).run();
   const txId = res.meta.last_row_id;
 
   try {
-    const textToEmbed = `Financial Transaction: Paid/received ${currency} ${finalAmount} for ${entity} on ${txDate}.${notes ? ` Notes: ${notes}` : ''}`;
+    const direction = txType === 'CREDIT' ? 'Received/credited' : 'Paid/spent';
+    const textToEmbed = `Financial Transaction [${txType}]: ${direction} ${currency} ${finalAmount} with ${entity} on ${txDate}.${account ? ` Account: ${account}.` : ''}${balance !== null ? ` Balance: ${balance}.` : ''}${notes ? ` Notes: ${notes}` : ''}`;
     const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
     const vector = embedRes.data[0];
     await env.VECTORIZE.upsert([
@@ -748,11 +795,14 @@ Return ONLY valid JSON without markdown code fences:`,
         values: vector,
         metadata: {
           type: 'transaction',
+          tx_type: txType,
           id: txId,
           entity_person: entity,
           amount: finalAmount,
           currency,
           transaction_date: txDate,
+          account,
+          balance,
           username,
           text: textToEmbed,
         },
@@ -764,7 +814,7 @@ Return ONLY valid JSON without markdown code fences:`,
 
   return {
     success: true,
-    tx: { id: txId, entity_person: entity, amount: finalAmount, currency, transaction_date: txDate, notes },
+    tx: { id: txId, tx_type: txType, entity_person: entity, amount: finalAmount, currency, transaction_date: txDate, account, balance, notes },
   };
 }
 
@@ -833,16 +883,23 @@ app.all('/sms/webhook', async (c) => {
     const sym = symbolMap[tx.currency] || `${tx.currency} `;
     
     if (token && chatId) {
+      const isCredit = tx.tx_type === 'CREDIT';
+      const typeLabel = isCredit ? '🟢 Income / Credit' : '🔴 Expense / Debit';
+      const partyLabel = isCredit ? 'From / Source' : 'Item / Vendor';
+      const sign = isCredit ? '+' : '-';
       const reply = 
         `📱 *Auto-Logged from Phone SMS:*\n` +
-        `• *Item / Vendor:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
-        `• *Amount:* ${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
+        `• *Type:* ${typeLabel}\n` +
+        `• *${partyLabel}:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
+        `• *Amount:* ${sign}${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
         `• *Date:* \`${tx.transaction_date}\`\n` +
+        (tx.account ? `• *Account:* \`${tx.account}\`\n` : '') +
+        (tx.balance !== null && tx.balance !== undefined ? `• *Avail Bal:* ${sym}${formatAmount(tx.balance, tx.currency)}\n` : '') +
         (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
         (sender ? `• *Sender:* \`${sender}\`\n` : '');
       await sendTelegramMessage(token, chatId, reply);
     }
-    return c.json({ success: true, type: 'expense', tx });
+    return c.json({ success: true, type: tx.tx_type === 'CREDIT' ? 'income' : 'expense', tx });
   }
 
   // Check if Event / Reminder
@@ -1026,6 +1083,7 @@ app.post('/api/v1/events', async (c) => {
 app.get('/api/v1/transactions', async (c) => {
   const username = c.req.query('username') || c.env.DEFAULT_USER || 'default_user';
   const entity = c.req.query('entity_person');
+  const type = c.req.query('type') || c.req.query('tx_type');
   const startDate = c.req.query('start_date');
   const endDate = c.req.query('end_date');
   const month = c.req.query('month');
@@ -1034,6 +1092,10 @@ app.get('/api/v1/transactions', async (c) => {
   let sql = 'SELECT * FROM transactions WHERE username = ?';
   const params: any[] = [username];
 
+  if (type) {
+    sql += ' AND tx_type = ?';
+    params.push(type.toUpperCase());
+  }
   if (entity) {
     sql += ' AND LOWER(entity_person) LIKE ?';
     params.push(`%${entity.toLowerCase()}%`);
@@ -1061,13 +1123,16 @@ app.get('/api/v1/transactions', async (c) => {
 app.post('/api/v1/transactions', async (c) => {
   const body = await c.req.json();
   const username = body.username || c.env.DEFAULT_USER || 'default_user';
+  const txType = (body.tx_type || body.type || 'DEBIT').toUpperCase() === 'CREDIT' ? 'CREDIT' : 'DEBIT';
   const entity = body.entity_person;
   const rawAmount = body.amount;
   const amount = typeof rawAmount === 'number'
     ? rawAmount
     : parseFloat(String(rawAmount || '').replace(/,/g, ''));
-  const currency = (body.currency || 'USD').toUpperCase();
+  const currency = (body.currency || 'INR').toUpperCase();
   const txDate = body.transaction_date || new Date().toISOString().split('T')[0];
+  const account = body.account || null;
+  const balance = body.balance !== undefined && body.balance !== null ? Number(body.balance) : null;
   const notes = body.notes || null;
   const isSecure = body.is_secure ? 1 : 0;
 
@@ -1076,15 +1141,16 @@ app.post('/api/v1/transactions', async (c) => {
   }
 
   const stmt = c.env.DB.prepare(`
-    INSERT INTO transactions (entity_person, amount, currency, transaction_date, notes, username, is_secure)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO transactions (tx_type, entity_person, amount, currency, transaction_date, account, balance, notes, username, is_secure)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const res = await stmt.bind(entity, amount, currency, txDate, notes, username, isSecure).run();
+  const res = await stmt.bind(txType, entity, amount, currency, txDate, account, balance, notes, username, isSecure).run();
   const txId = res.meta.last_row_id;
 
   // Dense Embedding & Index into Vectorize
   try {
-    const textToEmbed = `Financial Transaction: Paid/received $${amount} ${currency} with ${entity} on ${txDate}.${notes ? ` Notes: ${notes}` : ''}`;
+    const direction = txType === 'CREDIT' ? 'Received/credited' : 'Paid/spent';
+    const textToEmbed = `Financial Transaction [${txType}]: ${direction} ${amount} ${currency} with ${entity} on ${txDate}.${account ? ` Account: ${account}.` : ''}${balance !== null ? ` Balance: ${balance}.` : ''}${notes ? ` Notes: ${notes}` : ''}`;
     const embeddingRes = await c.env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
     const vector = embeddingRes.data[0];
     await c.env.VECTORIZE.upsert([
@@ -1093,11 +1159,14 @@ app.post('/api/v1/transactions', async (c) => {
         values: vector,
         metadata: {
           type: 'transaction',
+          tx_type: txType,
           id: txId,
           entity_person: entity,
           amount,
           currency,
           transaction_date: txDate,
+          account,
+          balance,
           username,
           text: textToEmbed,
         },
@@ -1107,7 +1176,7 @@ app.post('/api/v1/transactions', async (c) => {
     console.warn('Vectorize transaction index warning:', err);
   }
 
-  return c.json({ id: txId, message: 'Transaction saved and indexed.' }, 201);
+  return c.json({ id: txId, tx_type: txType, message: 'Transaction created and indexed.' }, 201);
 });
 
 // 3. Document / Notes Ingestion Endpoint
@@ -1289,9 +1358,9 @@ async function executeRagQuery(
     console.warn('D1 events query error:', e);
   }
 
-  // Search transactions via entity or general money/expense query or phone
+  // Search transactions via entity or general money/expense/income query or phone
   let matchingTx: any[] = [];
-  const isFinancial = /\b(expense|expenses|spend|spent|spending|bought|buy|purchase|purchases|bill|bills|paid|pay|payment|cost|costs|money|transaction|transactions|finance|financial|ledger|inr|usd|eur|gbp|rs|₹|\$)\b/i.test(query);
+  const isFinancial = /\b(expense|expenses|spend|spent|spending|bought|buy|purchase|purchases|bill|bills|paid|pay|payment|cost|costs|money|transaction|transactions|finance|financial|ledger|inr|usd|eur|gbp|rs|₹|\$|credit|credits|credited|debit|debits|debited|income|salary|deposit|deposited|refund|refunded|cashback|balance|balance sheet|cash flow)\b/i.test(query);
   try {
     if (phoneMatch) {
       const pTerm = `%${phoneMatch[0]}%`;
@@ -1365,9 +1434,15 @@ async function executeRagQuery(
     contextParts.push(`Events in Ledger:\n${matchingEvents.map(e => `- [Event #${e.id}] [${e.category}] ${e.title} on ${e.event_date} at ${e.location || 'N/A'} with ${e.entity_person || 'N/A'}${e.details ? `. Note: ${e.details}` : ''}`).join('\n')}`);
   }
 
-  // 3. Structured D1 Transactions
+  // 3. Structured D1 Transactions (Income / Credits & Expense / Debits)
   if (matchingTx.length > 0) {
-    contextParts.push(`Financial Records:\n${matchingTx.map(t => `- [Tx #${t.id}] Paid/received ${t.currency} ${formatAmount(t.amount, t.currency)} (${t.currency}) for/with ${t.entity_person} on ${t.transaction_date}${t.notes ? ` (Notes: ${t.notes})` : ''}`).join('\n')}`);
+    contextParts.push(`Financial Records (Income/Credits & Expenses/Debits):\n${matchingTx.map(t => {
+      const type = t.tx_type || 'DEBIT';
+      const dir = type === 'CREDIT' ? 'Received/Credited from' : 'Paid/Debited to';
+      const balStr = t.balance !== null && t.balance !== undefined ? ` (Avail Bal: ${t.balance})` : '';
+      const accStr = t.account ? ` [via ${t.account}]` : '';
+      return `- [Tx #${t.id} - ${type}] ${dir} ${t.currency} ${formatAmount(t.amount, t.currency)} (${t.currency}) ${t.entity_person} on ${t.transaction_date}${accStr}${balStr}${t.notes ? ` (Notes: ${t.notes})` : ''}`;
+    }).join('\n')}`);
   }
 
   // 4. Structured D1 SMS & Document Notes
@@ -1595,16 +1670,18 @@ app.post('/telegram/webhook', async (c) => {
       `📅 *View Your Agenda & History:*\n` +
       `• \`/today\` or \`/digest\` — View today's agenda & expenses\n` +
       `• \`/today YYYY-MM-DD\` — View agenda for a specific date\n` +
-      `• \`/events\` — List recent life events\n` +
-      `• \`/expenses [period]\` — List transactions (e.g. \`/expenses\`, \`/expenses 2026-09\`, \`/expenses 7d\`, \`/expenses 2026-09-17\`, \`/expenses <vendor>\`)\n\n` +
+      `• \`/balance [period]\` — View Financial Balance Sheet (e.g. \`/balance\`, \`/balance 2026-09\`, \`/balance 7d\`)\n` +
+      `• \`/expenses [period]\` — List transactions (e.g. \`/expenses\`, \`/expenses 2026-09\`, \`/expenses <vendor>\`)\n` +
+      `• \`/events\` — List recent life events\n\n` +
       `✍️ *Log Events & Transactions:*\n` +
       `• \`/log <details>\` — Log an event (e.g. \`/log AI workshop at office 10am\`)\n` +
-      `• \`/spend <amount> <description>\` — Log an expense (e.g. \`/spend 50 groceries\`, \`/spend $20 lunch\`, \`/spend 500 INR petrol\`)\n\n` +
+      `• \`/spend <amount> <description>\` — Log an expense (e.g. \`/spend 50 groceries\`, \`/spend 500 INR petrol\`)\n` +
+      `• \`/income <amount> <source>\` — Log an income (e.g. \`/income 50000 Salary\`, \`/income 1500 Freelance\`)\n\n` +
       `🗑️ *Manage Entries:*\n` +
       `• \`/delete <id>\` — Delete an event by ID (e.g. \`/delete 5\`)\n` +
       `• \`/delete_expense <id>\` — Delete a transaction by ID (e.g. \`/delete_expense 2\`)\n` +
       `• \`/clear\` or \`/reset\` — Clear conversational memory\n\n` +
-      `💬 *Or talk naturally!* Ask questions like _"What did I do yesterday?"_ or _"How much did I spend on groceries?"_ with multi-turn memory.`;
+      `💬 *Or talk naturally!* Ask questions like _"What is my balance sheet this month?"_ or _"How much did I spend on groceries?"_ with multi-turn memory.`;
     await sendTelegramMessage(token, chatId, helpMsg);
     return c.json({ ok: true });
   }
@@ -1643,6 +1720,73 @@ app.post('/telegram/webhook', async (c) => {
     return c.json({ ok: true });
   }
 
+  // /balance or /summary: Financial Balance Sheet
+  if (cmd === '/balance' || cmd === '/summary' || cmd === '/balancesheet') {
+    const period = parseExpensePeriod(args || 'this month', c.env.USER_TIMEZONE);
+    let sql = 'SELECT * FROM transactions WHERE username = ?';
+    const params: any[] = [username];
+
+    if (period.startDate && period.endDate) {
+      if (period.startDate === period.endDate) {
+        sql += ' AND transaction_date = ?';
+        params.push(period.startDate);
+      } else {
+        sql += ' AND transaction_date >= ? AND transaction_date <= ?';
+        params.push(period.startDate, period.endDate);
+      }
+    } else if (period.keyword) {
+      sql += ' AND (LOWER(entity_person) LIKE ? OR LOWER(notes) LIKE ?)';
+      params.push(`%${period.keyword}%`, `%${period.keyword}%`);
+    }
+
+    sql += ' ORDER BY transaction_date DESC, id DESC LIMIT ?';
+    params.push(Math.max(50, period.limit));
+
+    const { results } = await c.env.DB.prepare(sql).bind(...params).all();
+    const txList = (results || []) as any[];
+
+    const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+
+    let totalCredits = 0;
+    let totalDebits = 0;
+    let currency = 'INR';
+
+    for (const t of txList) {
+      if (t.currency) currency = t.currency;
+      const amt = Number(t.amount) || 0;
+      if (t.tx_type === 'CREDIT') {
+        totalCredits += amt;
+      } else {
+        totalDebits += amt;
+      }
+    }
+
+    const netCashFlow = totalCredits - totalDebits;
+    const sym = symbolMap[currency] || `${currency} `;
+    const netSign = netCashFlow >= 0 ? '+' : '-';
+    const netFormatted = `${netSign}${sym}${formatAmount(Math.abs(netCashFlow), currency)}`;
+
+    const lines = txList.slice(0, 10).map((t: any) => {
+      const s = symbolMap[t.currency] || `${t.currency} `;
+      const isCredit = t.tx_type === 'CREDIT';
+      const icon = isCredit ? '🟢' : '🔴';
+      const sign = isCredit ? '+' : '-';
+      return `${icon} (ID: \`#${t.id}\`) *${t.entity_person}:* ${sign}${s}${formatAmount(t.amount, t.currency)} on \`${t.transaction_date}\``;
+    });
+
+    let reply = 
+      `⚖️ *Financial Balance Sheet ${period.label}:*\n\n` +
+      `🟢 *Total Inflow (Credits):*  +${sym}${formatAmount(totalCredits, currency)}\n` +
+      `🔴 *Total Outflow (Debits):*  -${sym}${formatAmount(totalDebits, currency)}\n` +
+      `─────────────────────────────\n` +
+      `💵 *Net Cash Flow:* *${netFormatted}*\n\n` +
+      (lines.length > 0 ? `*Recent Breakdown (Latest ${lines.length}):*\n${lines.join('\n')}\n\n` : '_No transactions found in this period._\n\n') +
+      `_Tip: Query periods e.g. \`/balance 2026-09\`, \`/balance 7d\`, \`/balance today\`, or \`/balance last month\`._`;
+
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
   // /expenses: View expenses with period, date range, or keyword filtering
   if (cmd === '/expenses') {
     const period = parseExpensePeriod(args, c.env.USER_TIMEZONE);
@@ -1671,26 +1815,32 @@ app.post('/telegram/webhook', async (c) => {
     const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
     const lines = txList.map((t: any) => {
       const sym = symbolMap[t.currency] || `${t.currency} `;
-      return `• (ID: \`#${t.id}\`) *${t.entity_person}:* ${sym}${formatAmount(t.amount, t.currency)} (${t.currency}) on \`${t.transaction_date}\``;
+      const isCredit = t.tx_type === 'CREDIT';
+      const icon = isCredit ? '🟢' : '🔴';
+      const sign = isCredit ? '+' : '-';
+      return `${icon} (ID: \`#${t.id}\`) *${t.entity_person}:* ${sign}${sym}${formatAmount(t.amount, t.currency)} on \`${t.transaction_date}\``;
     });
 
     let summaryTotal = '';
     if (txList.length > 0) {
-      const totalsByCurrency: Record<string, number> = {};
+      let credits = 0;
+      let debits = 0;
+      let curr = 'INR';
       for (const t of txList) {
-        const curr = t.currency || 'INR';
-        totalsByCurrency[curr] = (totalsByCurrency[curr] || 0) + (Number(t.amount) || 0);
+        if (t.currency) curr = t.currency;
+        const amt = Number(t.amount) || 0;
+        if (t.tx_type === 'CREDIT') credits += amt;
+        else debits += amt;
       }
-      const sumStrings = Object.entries(totalsByCurrency).map(([curr, sum]) => {
-        const sym = symbolMap[curr] || `${curr} `;
-        return `${sym}${formatAmount(sum, curr)} (${curr})`;
-      });
-      summaryTotal = `\n\n💵 *Total:* ${sumStrings.join(', ')} (${txList.length} transaction${txList.length === 1 ? '' : 's'})`;
+      const sym = symbolMap[curr] || `${curr} `;
+      const net = credits - debits;
+      const netSign = net >= 0 ? '+' : '-';
+      summaryTotal = `\n\n🟢 *Inflow:* +${sym}${formatAmount(credits, curr)} | 🔴 *Outflow:* -${sym}${formatAmount(debits, curr)}\n💵 *Net:* *${netSign}${sym}${formatAmount(Math.abs(net), curr)}* (${txList.length} record${txList.length === 1 ? '' : 's'})`;
     }
 
     let reply = '';
     if (lines.length > 0) {
-      reply = `💰 *Transactions ${period.label}:*\n${lines.join('\n')}${summaryTotal}\n\n_Tip: Type /delete_expense <id> to remove an entry._`;
+      reply = `💰 *Transactions ${period.label}:*\n${lines.join('\n')}${summaryTotal}\n\n_Tip: Type /balance for full balance sheet, or /delete_expense <id> to remove._`;
     } else {
       reply = `💰 No transactions found ${period.label}.\n\n_Tip: Filter by date or period e.g. \`/expenses 2026-09\`, \`/expenses 7d\`, \`/expenses 2026-09-17\`, or \`/expenses\` for latest._`;
     }
@@ -1747,7 +1897,7 @@ app.post('/telegram/webhook', async (c) => {
     return c.json({ ok: true });
   }
 
-  // /spend or /expense: Log financial transaction
+  // /spend or /expense: Log outgoing expense
   if (cmd === '/spend' || cmd === '/expense') {
     if (!args) {
       await sendTelegramMessage(
@@ -1757,16 +1907,40 @@ app.post('/telegram/webhook', async (c) => {
       );
       return c.json({ ok: true });
     }
-    const { tx } = await extractAndLogExpense(c.env, args, username);
+    const { tx } = await extractAndLogExpense(c.env, `Spent ${args}`, username);
     const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
     const sym = symbolMap[tx.currency] || `${tx.currency} `;
     const reply = 
-      `💰 *Expense Logged:*\n` +
+      `🔴 *Expense Logged:*\n` +
       `• *Item / Vendor:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
-      `• *Amount:* ${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
+      `• *Amount:* -${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
       `• *Date:* \`${tx.transaction_date}\`\n` +
       (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
-      `\n_Tip: Type /expenses to view recent transactions or /today for agenda._`;
+      `\n_Tip: Type /balance for full balance sheet or /expenses for recent entries._`;
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
+  // /income or /credit: Log incoming money / salary / cashback
+  if (cmd === '/income' || cmd === '/credit' || cmd === '/receive') {
+    if (!args) {
+      await sendTelegramMessage(
+        token,
+        chatId,
+        '⚠️ *Please specify the amount and source.*\n\nExamples:\n• `/income 50000 Salary from Employer`\n• `/income 1500 Freelance project`\n• `/income 200 Cashback from GPay`'
+      );
+      return c.json({ ok: true });
+    }
+    const { tx } = await extractAndLogExpense(c.env, `Received / credited ${args}`, username);
+    const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+    const sym = symbolMap[tx.currency] || `${tx.currency} `;
+    const reply = 
+      `🟢 *Income Logged:*\n` +
+      `• *From / Source:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
+      `• *Amount:* +${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
+      `• *Date:* \`${tx.transaction_date}\`\n` +
+      (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
+      `\n_Tip: Type /balance for full balance sheet or /expenses for recent entries._`;
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
@@ -1853,13 +2027,19 @@ app.post('/telegram/webhook', async (c) => {
     const { tx } = await extractAndLogExpense(c.env, trimmedText, username);
     const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
     const sym = symbolMap[tx.currency] || `${tx.currency} `;
+    const isCredit = tx.tx_type === 'CREDIT';
+    const title = isCredit ? '🟢 *Income / Credit Logged Automatically:*' : '🔴 *Expense / Debit Logged Automatically:*';
+    const partyLabel = isCredit ? 'From / Source' : 'Item / Vendor';
+    const sign = isCredit ? '+' : '-';
     const reply = 
-      `💰 *Expense Logged Automatically:*\n` +
-      `• *Item / Vendor:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
-      `• *Amount:* ${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
+      `${title}\n` +
+      `• *${partyLabel}:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
+      `• *Amount:* ${sign}${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
       `• *Date:* \`${tx.transaction_date}\`\n` +
+      (tx.account ? `• *Account:* \`${tx.account}\`\n` : '') +
+      (tx.balance !== null && tx.balance !== undefined ? `• *Avail Bal:* ${sym}${formatAmount(tx.balance, tx.currency)}\n` : '') +
       (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
-      `\n_Tip: Type /expenses to view recent transactions or /today for agenda._`;
+      `\n_Tip: Type /balance for full balance sheet or /expenses for recent entries._`;
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }

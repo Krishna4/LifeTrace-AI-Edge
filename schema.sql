@@ -30,13 +30,16 @@ CREATE TABLE IF NOT EXISTS personal_events (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- 3. Financial Transactions Table
+-- 3. Financial Transactions Table (Debits & Credits / Balance Sheet)
 CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tx_type TEXT NOT NULL DEFAULT 'DEBIT', -- 'DEBIT' (expense/outflow) or 'CREDIT' (income/inflow)
     entity_person TEXT NOT NULL,
     amount REAL NOT NULL,
-    currency TEXT NOT NULL DEFAULT 'USD',
+    currency TEXT NOT NULL DEFAULT 'INR',
     transaction_date TEXT NOT NULL,
+    account TEXT,
+    balance REAL,
     notes TEXT,
     username TEXT NOT NULL DEFAULT 'default_user',
     is_secure INTEGER NOT NULL DEFAULT 0,
@@ -59,6 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_personal_events_user ON personal_events(username)
 CREATE INDEX IF NOT EXISTS idx_personal_events_date ON personal_events(event_date);
 CREATE INDEX IF NOT EXISTS idx_personal_events_cat ON personal_events(category);
 CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(username);
+CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(tx_type);
 CREATE INDEX IF NOT EXISTS idx_transactions_entity ON transactions(entity_person);
 CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
 CREATE INDEX IF NOT EXISTS idx_conv_chat ON conversation_history(chat_id, id DESC);
