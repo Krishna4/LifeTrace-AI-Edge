@@ -615,6 +615,12 @@ function parseSmsDate(text: string): string | null {
 
 function isFinancialSmsOrSpend(text: string): boolean {
   const trimmed = text.trim();
+
+  // 1. Filter out OTPs, verification codes, and authentication messages (never log OTPs as transactions)
+  if (/\b(?:otp|one[- ]time password|verification code|secret code|do not share|never share)\b/i.test(trimmed)) {
+    return false;
+  }
+
   const hasMoney = /(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$))/i.test(trimmed);
   if (!hasMoney) return false;
 
@@ -673,8 +679,8 @@ async function extractAndLogExpense(
           content: `You are a financial transaction extraction assistant. Today's date is ${todayStr}.
 Analyze the user message (which may be a bank SMS alert, credit card notification, UPI alert, income or spend note) and extract into a single JSON object with this schema:
 {
-  "tx_type": "DEBIT" | "CREDIT" (Use "CREDIT" if money was received, credited, deposited, refunded, salary, cashback, or added; Use "DEBIT" if money was spent, sent, paid, debited, charged, withdrawn, or expense),
-  "entity_person": "Sender/Payer if Credit (e.g. Employer, Client name, Person, Refund source); or Merchant/Recipient if Debit (e.g. Swiggy, Amazon, Person name, Grocery)",
+  "tx_type": "DEBIT" | "CREDIT",
+  "entity_person": "Sender/Payer if Credit (e.g. Employer, Client name, Person, Refund source); or Merchant/Beneficiary/Recipient if Debit (e.g. Swiggy, Amazon, Person name, Grocery, Beneficiary)",
   "amount": number (The actual currency amount in RUPEES or DOLLARS, NOT in paise or cents! E.g. For 'Rs. 190', amount MUST BE 190, NEVER 19000. Do NOT multiply by 100. Do NOT use account numbers, card numbers, UPI reference numbers, or dates as amount),
   "currency": "INR" | "USD" | "EUR" | "GBP",
   "transaction_date": "YYYY-MM-DD (resolve dates in SMS like 23-Sep-26 or 17-Sep-26 into YYYY-MM-DD)",
@@ -682,6 +688,11 @@ Analyze the user message (which may be a bank SMS alert, credit card notificatio
   "balance": number | null (Available or updated account balance if stated in the message e.g. from 'Avail Bal: Rs 1,45,230', otherwise null),
   "notes": "Bank name, UPI reference number, payment mode, or short description"
 }
+CRITICAL RULES FOR "tx_type":
+1. BENEFICIARY TRANSFERS ARE DEBITS: If the SMS says "credited to beneficiary", "credited to beneficiary account", "credited to payee", "credited to receiver", "credited to recipient", or mentions "sent to", "transferred to", this is money SENT by the user to someone else. It is a DEBIT from the user's account, NOT a credit!
+2. CREDIT CARD CHARGES ARE DEBITS: "spent on Credit Card", "charged to Credit Card" is a DEBIT.
+3. ONLY USE "CREDIT" if money was actually received or deposited INTO the user's account (e.g. "credited to your A/c", "received from", "salary", "refund", "cashback", "deposited to your account").
+4. When in doubt or if money left the user's account, mark as "DEBIT".
 Return ONLY valid JSON without markdown code fences:`,
         },
         { role: 'user', content: rawText },
@@ -705,12 +716,21 @@ Return ONLY valid JSON without markdown code fences:`,
     console.warn('AI expense extraction warning:', err);
   }
 
+  // Check if this is a transfer to a beneficiary/payee (always a DEBIT for the user)
+  const isBeneficiaryCredit = /credited to (?:beneficiary|payee|receiver|recipient|other)/i.test(rawText) ||
+                              /(?:sent|transferred|paid)\s+(?:to|from|rs|inr|₹|[0-9]).*credited/i.test(rawText);
+
   // Determine Transaction Direction (DEBIT vs CREDIT)
   let txType = 'DEBIT';
-  if (parsed?.tx_type === 'CREDIT' || parsed?.tx_type === 'DEBIT') {
+  if (isBeneficiaryCredit) {
+    txType = 'DEBIT';
+  } else if (parsed?.tx_type === 'CREDIT' || parsed?.tx_type === 'DEBIT') {
     txType = parsed.tx_type;
   } else {
-    const isCredit = /\b(credited|credit|received|deposited|deposit|refund|refunded|cashback|salary|added)\b/i.test(rawText);
+    const isCredit = (
+      /\b(received|deposited|deposit|refund|refunded|cashback|salary|added)\b/i.test(rawText) ||
+      (/\bcredited\b/i.test(rawText) && !/\bdebited\b/i.test(rawText))
+    ) && !isBeneficiaryCredit;
     txType = isCredit ? 'CREDIT' : 'DEBIT';
   }
 
@@ -801,8 +821,8 @@ Return ONLY valid JSON without markdown code fences:`,
           amount: finalAmount,
           currency,
           transaction_date: txDate,
-          account,
-          balance,
+          account: account || '',
+          balance: balance !== null && balance !== undefined ? balance : 0,
           username,
           text: textToEmbed,
         },
@@ -1165,8 +1185,8 @@ app.post('/api/v1/transactions', async (c) => {
           amount,
           currency,
           transaction_date: txDate,
-          account,
-          balance,
+          account: account || '',
+          balance: balance !== null && balance !== undefined ? balance : 0,
           username,
           text: textToEmbed,
         },
