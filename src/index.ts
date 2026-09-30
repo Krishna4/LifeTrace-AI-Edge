@@ -202,7 +202,15 @@ async function sendTelegramMessage(token: string, chatId: string, text: string, 
   }
 }
 
+function getYesterdayDateStr(todayStr: string): string {
+  const d = new Date(todayStr + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().split('T')[0];
+}
+
 interface DailyDigestData {
+  yesterdayStr: string;
+  yesterdayExpenses: any[];
   todayEvents: any[];
   reminders: any[];
   upcomingEvents: any[];
@@ -214,11 +222,13 @@ async function getDailyDigestData(
   username: string,
   targetDate: string
 ): Promise<DailyDigestData> {
+  const yesterdayStr = getYesterdayDateStr(targetDate);
   const [
     { results: todayEvents },
     { results: reminders },
     { results: upcomingEvents },
     { results: todayExpenses },
+    { results: yesterdayExpenses },
   ] = await Promise.all([
     // 1. Events on target date
     env.DB.prepare(
@@ -255,10 +265,15 @@ async function getDailyDigestData(
        ORDER BY event_date ASC, id ASC LIMIT 5`
     ).bind(username, targetDate, targetDate).all(),
 
-    // 4. Transactions for target date
+    // 4. Transactions for target date (today)
     env.DB.prepare(
       'SELECT * FROM transactions WHERE username = ? AND transaction_date = ? ORDER BY id ASC'
     ).bind(username, targetDate).all(),
+
+    // 5. Transactions for yesterday (for morning financial recap)
+    env.DB.prepare(
+      'SELECT * FROM transactions WHERE username = ? AND transaction_date = ? ORDER BY id ASC'
+    ).bind(username, yesterdayStr).all(),
   ]);
 
   // Deduplicate: Don't repeat today's events in active reminders
@@ -266,6 +281,8 @@ async function getDailyDigestData(
   const filteredReminders = (reminders || []).filter((r: any) => !todayIds.has(r.id));
 
   return {
+    yesterdayStr,
+    yesterdayExpenses: yesterdayExpenses || [],
     todayEvents: todayEvents || [],
     reminders: filteredReminders,
     upcomingEvents: upcomingEvents || [],
@@ -279,15 +296,15 @@ function formatEventsForDigest(
   data: DailyDigestData
 ): string {
   const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
-  const { todayEvents, reminders, upcomingEvents, todayExpenses } = data;
+  const { yesterdayStr, yesterdayExpenses, todayEvents, reminders, upcomingEvents, todayExpenses } = data;
 
-  const totalItems = todayEvents.length + reminders.length + upcomingEvents.length + todayExpenses.length;
+  const totalItems = yesterdayExpenses.length + todayEvents.length + reminders.length + upcomingEvents.length + todayExpenses.length;
 
   if (totalItems === 0) {
     return (
-      `🌱 *LifeTrace AI Daily Agenda*\n` +
+      `🌱 *LifeTrace AI Daily Briefing*\n` +
       `📅 *${targetDateStr}* (User: \`${username}\`)\n\n` +
-      `🎉 _No events, reminders, or expenses scheduled for today._\n\n` +
+      `🎉 _No events, reminders, or recent expenses recorded._\n\n` +
       `_Tip: Log events with \`/log <details>\` or expenses with \`/spend <amount> <item>\`._`
     );
   }
@@ -305,7 +322,46 @@ function formatEventsForDigest(
 
   let output = `🌱 *LifeTrace AI Daily Briefing*\n📅 *${targetDateStr}* (User: \`${username}\`)\n\n`;
 
-  // 1. Today's Events
+  // 1. Yesterday's Financial Ledger Alert (Credits & Debits)
+  if (yesterdayExpenses.length > 0) {
+    let yCredits = 0;
+    let yDebits = 0;
+    let yTransfers = 0;
+    let yCurr = 'INR';
+
+    const yLines = yesterdayExpenses.map((tx: any) => {
+      const sym = symbolMap[tx.currency] || `${tx.currency} `;
+      if (tx.currency) yCurr = tx.currency;
+      const amt = Number(tx.amount) || 0;
+      if (tx.tx_type === 'CREDIT') {
+        yCredits += amt;
+        return `• 🟢 +${sym}${formatAmount(amt, tx.currency)} — *${tx.entity_person}*`;
+      } else if (tx.tx_type === 'TRANSFER') {
+        yTransfers += amt;
+        return `• 🔄 ⇄ ${sym}${formatAmount(amt, tx.currency)} — *${tx.entity_person}* _(Transfer/Bill)_`;
+      } else {
+        yDebits += amt;
+        return `• 🔴 -${sym}${formatAmount(amt, tx.currency)} — *${tx.entity_person}*`;
+      }
+    });
+
+    const ySym = symbolMap[yCurr] || `${yCurr} `;
+    const yNet = yCredits - yDebits;
+    const yNetSign = yNet >= 0 ? '+' : '-';
+
+    output += `📊 *Yesterday's Financial Summary (\`${yesterdayStr}\`):*\n` +
+      `🟢 *Income:* +${ySym}${formatAmount(yCredits, yCurr)} | 🔴 *Expenses:* -${ySym}${formatAmount(yDebits, yCurr)}` +
+      (yTransfers > 0 ? ` | 🔄 *Transfers:* ${ySym}${formatAmount(yTransfers, yCurr)}` : '') + `\n` +
+      `💵 *Net Cash Flow:* *${yNetSign}${ySym}${formatAmount(Math.abs(yNet), yCurr)}*\n` +
+      `${yLines.slice(0, 8).join('\n')}` +
+      (yLines.length > 8 ? `\n_...and ${yLines.length - 8} more transactions._` : '') +
+      `\n\n`;
+  } else {
+    output += `📊 *Yesterday's Financial Summary (\`${yesterdayStr}\`):*\n` +
+      `_No transactions recorded for yesterday._\n\n`;
+  }
+
+  // 2. Today's Events
   if (todayEvents.length > 0) {
     const blocks = todayEvents.map((ev, i) => {
       const icon = icons[ev.category?.toUpperCase()] || '📌';
@@ -327,7 +383,7 @@ function formatEventsForDigest(
     output += `🔔 *Today's Schedule (${todayEvents.length}):*\n${blocks.join('\n\n')}\n\n`;
   }
 
-  // 2. Active Reminders & Daily Habits
+  // 3. Active Reminders & Daily Habits
   if (reminders.length > 0) {
     const remBlocks = reminders.map((r) => {
       let line = `• (ID: \`#${r.id}\`) ⏰ *${r.title}*`;
@@ -337,7 +393,7 @@ function formatEventsForDigest(
     output += `⏰ *Active Reminders & Daily Habits (${reminders.length}):*\n${remBlocks.join('\n')}\n\n`;
   }
 
-  // 3. Upcoming in Next 3 Days
+  // 4. Upcoming in Next 3 Days
   if (upcomingEvents.length > 0) {
     const upBlocks = upcomingEvents.map((up) => {
       const icon = icons[up.category?.toUpperCase()] || '🗓️';
@@ -346,7 +402,7 @@ function formatEventsForDigest(
     output += `🗓️ *Upcoming in Next 3 Days:*\n${upBlocks.join('\n')}\n\n`;
   }
 
-  // 4. Today's Financial Activity
+  // 5. Today's Financial Activity
   if (todayExpenses.length > 0) {
     let dayCredits = 0;
     let dayDebits = 0;
@@ -355,11 +411,12 @@ function formatEventsForDigest(
       const sym = symbolMap[tx.currency] || `${tx.currency} `;
       if (tx.currency) curr = tx.currency;
       const isCredit = tx.tx_type === 'CREDIT';
-      const icon = isCredit ? '🟢' : '🔴';
-      const sign = isCredit ? '+' : '-';
+      const isTransfer = tx.tx_type === 'TRANSFER';
+      const icon = isCredit ? '🟢' : (isTransfer ? '🔄' : '🔴');
+      const sign = isCredit ? '+' : (isTransfer ? '⇄ ' : '-');
       const amt = Number(tx.amount) || 0;
       if (isCredit) dayCredits += amt;
-      else dayDebits += amt;
+      else if (!isTransfer) dayDebits += amt;
       return `• ${icon} (ID: \`#${tx.id}\`) *${tx.entity_person}:* ${sign}${sym}${formatAmount(amt, tx.currency)}${tx.notes && tx.notes !== tx.entity_person ? ` — _${tx.notes}_` : ''}`;
     });
     const sym = symbolMap[curr] || `${curr} `;
@@ -370,8 +427,8 @@ function formatEventsForDigest(
       `${txLines.join('\n')}\n\n`;
   }
 
-  output += `_Reply to ask questions, log new activities, or manage entries!_`;
-  return output;
+  output += `_Tip: Type /yesterday for full recap, /balance for monthly summary, or /today for agenda._`;
+  return output.trim();
 }
 
 async function extractAndLogEvent(
@@ -677,10 +734,10 @@ async function extractAndLogExpense(
         {
           role: 'system',
           content: `You are a financial transaction extraction assistant. Today's date is ${todayStr}.
-Analyze the user message (which may be a bank SMS alert, credit card notification, UPI alert, income or spend note) and extract into a single JSON object with this schema:
+Analyze the user message (which may be a bank SMS alert, credit card notification, UPI alert, income, transfer, or spend note) and extract into a single JSON object with this schema:
 {
-  "tx_type": "DEBIT" | "CREDIT",
-  "entity_person": "Sender/Payer if Credit (e.g. Employer, Client name, Person, Refund source); or Merchant/Beneficiary/Recipient if Debit (e.g. Swiggy, Amazon, Person name, Grocery, Beneficiary)",
+  "tx_type": "DEBIT" | "CREDIT" | "TRANSFER",
+  "entity_person": "Sender/Payer if Credit (e.g. Employer, Client name, Person, Refund source); Merchant/Beneficiary/Recipient if Debit (e.g. Swiggy, Amazon, Person name, Grocery); Card/Wallet/Account if Transfer (e.g. HDFC Credit Card Bill, SBI Card, ICICI FASTag, Amazon Pay, Self Transfer)",
   "amount": number (The actual currency amount in RUPEES or DOLLARS, NOT in paise or cents! E.g. For 'Rs. 190', amount MUST BE 190, NEVER 19000. Do NOT multiply by 100. Do NOT use account numbers, card numbers, UPI reference numbers, or dates as amount),
   "currency": "INR" | "USD" | "EUR" | "GBP",
   "transaction_date": "YYYY-MM-DD (resolve dates in SMS like 23-Sep-26 or 17-Sep-26 into YYYY-MM-DD)",
@@ -689,10 +746,14 @@ Analyze the user message (which may be a bank SMS alert, credit card notificatio
   "notes": "Bank name, UPI reference number, payment mode, or short description"
 }
 CRITICAL RULES FOR "tx_type":
-1. BENEFICIARY TRANSFERS ARE DEBITS: If the SMS says "credited to beneficiary", "credited to beneficiary account", "credited to payee", "credited to receiver", "credited to recipient", or mentions "sent to", "transferred to", this is money SENT by the user to someone else. It is a DEBIT from the user's account, NOT a credit!
-2. CREDIT CARD CHARGES ARE DEBITS: "spent on Credit Card", "charged to Credit Card" is a DEBIT.
-3. ONLY USE "CREDIT" if money was actually received or deposited INTO the user's account (e.g. "credited to your A/c", "received from", "salary", "refund", "cashback", "deposited to your account").
-4. When in doubt or if money left the user's account, mark as "DEBIT".
+1. TRANSFERS & BILL REPAYMENTS (tx_type = "TRANSFER"):
+   - Credit Card bill payments & acknowledgements: Any SMS saying "Payment of Rs X received towards your credit card ending ...", "payment received for SBI Card / HDFC Card / Axis Card / Scapia / Slice", or "debited towards Credit Card bill / CRED Club / CREDIN" is a TRANSFER (repaying your own card liability, NOT income or new expense!).
+   - Wallet top-ups & recharges: "Added to wallet", "loaded to Amazon Pay balance / PayZapp", "recharge for FASTag successful", or "debited for FASTag / wallet load" is a TRANSFER (moving money between your accounts, NOT income or expense!).
+   - Self account transfers: Transfer between user's own accounts or sweep-in/sweep-out is a TRANSFER.
+2. BENEFICIARY TRANSFERS ARE DEBITS (tx_type = "DEBIT"): If the SMS says "credited to beneficiary", "credited to beneficiary account", "credited to payee", "credited to receiver", "credited to recipient", or mentions "sent to", "transferred to", this is money SENT by the user to someone else. It is a DEBIT from the user's account, NOT a credit!
+3. CREDIT CARD CHARGES ARE DEBITS: "spent on Credit Card", "charged to Credit Card", or purchases at merchants are DEBITS.
+4. ONLY USE "CREDIT" if real income was deposited INTO the user's account from outside (e.g. "salary", "refund", "cashback", "deposited to your account by employer/client", "received from someone").
+5. When in doubt or if money left the user's account, mark as "DEBIT".
 Return ONLY valid JSON without markdown code fences:`,
         },
         { role: 'user', content: rawText },
@@ -716,19 +777,35 @@ Return ONLY valid JSON without markdown code fences:`,
     console.warn('AI expense extraction warning:', err);
   }
 
+  // Check if this is a transfer/bill payment/wallet recharge:
+  const isTransfer = (
+    // Credit card bill payments & acknowledgements
+    /(?:payment\s+(?:of\s+)?(?:inr|rs\.?|₹)?\s*[0-9].*(?:towards|for|to).*(?:card|sbi\s*card|scapia|slice|cred)|payment.*(?:received|credited|processed|successful).*(?:towards|for|to).*(?:card|sbi\s*card|scapia|slice))/i.test(rawText) ||
+    /(?:towards|for)\s+(?:your\s+)?(?:credit\s*card|card ending|card account|sbi card|scapia|slice card)/i.test(rawText) ||
+    /\b(?:cred\s*club|credin|credit\s*card\s*bill)\b/i.test(rawText) ||
+    // Wallet / FASTag top-ups
+    /(?:recharge\s+(?:for|of)|top-?up|loaded).*(?:fastag|wallet|amazon\s*pay|payzapp)/i.test(rawText) ||
+    /(?:fastag|wallet).*(?:recharge|top-?up|loaded)/i.test(rawText) ||
+    /(?:added|loaded)\s+(?:money\s+)?to\s+(?:your\s+)?(?:wallet|fastag|amazon\s*pay|payzapp)/i.test(rawText) ||
+    // Self-transfers
+    /\b(?:transferred to self|transfer to own|sweep-in|sweep-out|self-transfer)\b/i.test(rawText)
+  );
+
   // Check if this is a transfer to a beneficiary/payee (always a DEBIT for the user)
   const isBeneficiaryCredit = /credited to (?:beneficiary|payee|receiver|recipient|other)/i.test(rawText) ||
                               /(?:sent|transferred|paid)\s+(?:to|from|rs|inr|₹|[0-9]).*credited/i.test(rawText);
 
-  // Determine Transaction Direction (DEBIT vs CREDIT)
+  // Determine Transaction Direction (DEBIT vs CREDIT vs TRANSFER)
   let txType = 'DEBIT';
-  if (isBeneficiaryCredit) {
+  if (isTransfer) {
+    txType = 'TRANSFER';
+  } else if (isBeneficiaryCredit) {
     txType = 'DEBIT';
-  } else if (parsed?.tx_type === 'CREDIT' || parsed?.tx_type === 'DEBIT') {
+  } else if (parsed?.tx_type === 'TRANSFER' || parsed?.tx_type === 'CREDIT' || parsed?.tx_type === 'DEBIT') {
     txType = parsed.tx_type;
   } else {
     const isCredit = (
-      /\b(received|deposited|deposit|refund|refunded|cashback|salary|added)\b/i.test(rawText) ||
+      /\b(received|deposited|deposit|refund|refunded|cashback|salary)\b/i.test(rawText) ||
       (/\bcredited\b/i.test(rawText) && !/\bdebited\b/i.test(rawText))
     ) && !isBeneficiaryCredit;
     txType = isCredit ? 'CREDIT' : 'DEBIT';
@@ -787,7 +864,7 @@ Return ONLY valid JSON without markdown code fences:`,
     }
   }
 
-  const defaultEntity = txType === 'CREDIT' ? 'General Income' : 'General Expense';
+  const defaultEntity = txType === 'CREDIT' ? 'General Income' : (txType === 'TRANSFER' ? 'Transfer / Card Bill' : 'General Expense');
   const entity = (parsed?.entity_person && typeof parsed.entity_person === 'string' && parsed.entity_person !== 'General Expense' && parsed.entity_person.trim().length > 0)
     ? parsed.entity_person.trim()
     : (regexEntity !== 'General Expense' ? regexEntity : defaultEntity);
@@ -813,7 +890,7 @@ Return ONLY valid JSON without markdown code fences:`,
   const txId = res.meta.last_row_id;
 
   try {
-    const direction = txType === 'CREDIT' ? 'Received/credited' : 'Paid/spent';
+    const direction = txType === 'CREDIT' ? 'Received/credited' : (txType === 'TRANSFER' ? 'Transfer/bill payment' : 'Paid/spent');
     const textToEmbed = `Financial Transaction [${txType}]: ${direction} ${currency} ${finalAmount} with ${entity} on ${txDate}.${account ? ` Account: ${account}.` : ''}${balance !== null ? ` Balance: ${balance}.` : ''}${notes ? ` Notes: ${notes}` : ''}`;
     const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
     const vector = embedRes.data[0];
@@ -912,9 +989,10 @@ app.all('/sms/webhook', async (c) => {
     
     if (token && chatId) {
       const isCredit = tx.tx_type === 'CREDIT';
-      const typeLabel = isCredit ? '🟢 Income / Credit' : '🔴 Expense / Debit';
-      const partyLabel = isCredit ? 'From / Source' : 'Item / Vendor';
-      const sign = isCredit ? '+' : '-';
+      const isTransfer = tx.tx_type === 'TRANSFER';
+      const typeLabel = isCredit ? '🟢 Income / Credit' : (isTransfer ? '🔄 Transfer / Card Bill Payment' : '🔴 Expense / Debit');
+      const partyLabel = isCredit ? 'From / Source' : (isTransfer ? 'Account / Card / Wallet' : 'Item / Vendor');
+      const sign = isCredit ? '+' : (isTransfer ? '⇄ ' : '-');
       const reply = 
         `📱 *Auto-Logged from Phone SMS:*\n` +
         `• *Type:* ${typeLabel}\n` +
@@ -927,7 +1005,7 @@ app.all('/sms/webhook', async (c) => {
         (sender ? `• *Sender:* \`${sender}\`\n` : '');
       await sendTelegramMessage(token, chatId, reply);
     }
-    return c.json({ success: true, type: tx.tx_type === 'CREDIT' ? 'income' : 'expense', tx });
+    return c.json({ success: true, type: tx.tx_type.toLowerCase(), tx });
   }
 
   // Check if Event / Reminder
@@ -1696,6 +1774,7 @@ app.post('/telegram/webhook', async (c) => {
     const helpMsg = 
       `🌱 *LifeTrace AI — Command Directory*\n\n` +
       `📅 *View Your Agenda & History:*\n` +
+      `• \`/yesterday\` — View yesterday's financial recap (credits, debits, transfers) & events\n` +
       `• \`/today\` or \`/digest\` — View today's agenda & expenses\n` +
       `• \`/today YYYY-MM-DD\` — View agenda for a specific date\n` +
       `• \`/balance [period]\` — View Financial Balance Sheet (e.g. \`/balance\`, \`/balance 2026-09\`, \`/balance 7d\`)\n` +
@@ -1704,7 +1783,8 @@ app.post('/telegram/webhook', async (c) => {
       `✍️ *Log Events & Transactions:*\n` +
       `• \`/log <details>\` — Log an event (e.g. \`/log AI workshop at office 10am\`)\n` +
       `• \`/spend <amount> <description>\` — Log an expense (e.g. \`/spend 50 groceries\`, \`/spend 500 INR petrol\`)\n` +
-      `• \`/income <amount> <source>\` — Log an income (e.g. \`/income 50000 Salary\`, \`/income 1500 Freelance\`)\n\n` +
+      `• \`/income <amount> <source>\` — Log an income (e.g. \`/income 50000 Salary\`, \`/income 1500 Freelance\`)\n` +
+      `• \`/transfer <amount> <details>\` — Log an internal transfer, credit card bill, or wallet top-up\n\n` +
       `🗑️ *Manage Entries:*\n` +
       `• \`/delete <id>\` — Delete an event by ID (e.g. \`/delete 5\`)\n` +
       `• \`/delete_expense <id>\` — Delete a transaction by ID (e.g. \`/delete_expense 2\`)\n` +
@@ -1727,6 +1807,91 @@ app.post('/telegram/webhook', async (c) => {
     }
 
     await sendTelegramMessage(token, chatId, digestText);
+    return c.json({ ok: true });
+  }
+
+  // 2. /yesterday: Dedicated financial alert & recap for yesterday (credits, debits, transfers, net, events)
+  if (cmd === '/yesterday' || cmd === 'yesterday') {
+    const todayStr = getTodayDateStr(c.env.USER_TIMEZONE);
+    const yesterdayStr = getYesterdayDateStr(todayStr);
+
+    const [
+      { results: yesterdayTransactions },
+      { results: yesterdayEvents },
+    ] = await Promise.all([
+      c.env.DB.prepare(
+        'SELECT * FROM transactions WHERE username = ? AND transaction_date = ? ORDER BY id ASC'
+      ).bind(username, yesterdayStr).all(),
+      c.env.DB.prepare(
+        'SELECT * FROM personal_events WHERE username = ? AND event_date = ? ORDER BY id ASC'
+      ).bind(username, yesterdayStr).all(),
+    ]);
+
+    const txList = (yesterdayTransactions || []) as any[];
+    const evList = (yesterdayEvents || []) as any[];
+    const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+
+    let reply = `📊 *Yesterday's Daily Alert & Recap (\`${yesterdayStr}\`)*\n`;
+    reply += `👤 User: \`${username}\`\n\n`;
+
+    if (txList.length === 0 && evList.length === 0) {
+      reply += `_No financial transactions or life events were logged for yesterday._\n\n` +
+        `_Tip: Type /balance for full monthly summary or /today for today's agenda._`;
+      await sendTelegramMessage(token, chatId, reply);
+      return c.json({ ok: true });
+    }
+
+    if (txList.length > 0) {
+      let credits = 0;
+      let debits = 0;
+      let transfers = 0;
+      let curr = 'INR';
+
+      const lines = txList.map((t: any) => {
+        if (t.currency) curr = t.currency;
+        const sym = symbolMap[t.currency] || `${t.currency} `;
+        const amt = Number(t.amount) || 0;
+        if (t.tx_type === 'CREDIT') {
+          credits += amt;
+          return `• 🟢 (ID: \`#${t.id}\`) *${t.entity_person}:* +${sym}${formatAmount(amt, t.currency)}${t.account ? ` (${t.account})` : ''}`;
+        } else if (t.tx_type === 'TRANSFER') {
+          transfers += amt;
+          return `• 🔄 (ID: \`#${t.id}\`) *${t.entity_person}:* ⇄ ${sym}${formatAmount(amt, t.currency)} _(Transfer/Bill)_`;
+        } else {
+          debits += amt;
+          return `• 🔴 (ID: \`#${t.id}\`) *${t.entity_person}:* -${sym}${formatAmount(amt, t.currency)}${t.account ? ` (${t.account})` : ''}`;
+        }
+      });
+
+      const sym = symbolMap[curr] || `${curr} `;
+      const net = credits - debits;
+      const netSign = net >= 0 ? '+' : '-';
+
+      reply += `💰 *Financial Activity (${txList.length}):*\n` +
+        `🟢 *Total Income (Credits):*     +${sym}${formatAmount(credits, curr)}\n` +
+        `🔴 *Total Expenses (Debits):*   -${sym}${formatAmount(debits, curr)}\n` +
+        (transfers > 0 ? `🔄 *Transfers & Card Bills:*    ⇄ ${sym}${formatAmount(transfers, curr)}\n` : '') +
+        `─────────────────────────────\n` +
+        `💵 *Net Cash Flow:* *${netSign}${sym}${formatAmount(Math.abs(net), curr)}*\n\n` +
+        `*Transaction Details:*\n${lines.join('\n')}\n\n`;
+    } else {
+      reply += `💰 *Financial Activity:*\n_No transactions recorded for yesterday._\n\n`;
+    }
+
+    if (evList.length > 0) {
+      reply += `📅 *Events & Notes Logged Yesterday (${evList.length}):*\n`;
+      evList.forEach((e: any, idx: number) => {
+        reply += `*${idx + 1}.* (ID: \`#${e.id}\`) *[${e.category}]* ${e.title}`;
+        if (e.location) reply += `\n   📍 Location: ${e.location}`;
+        if (e.entity_person) reply += `\n   👤 With: ${e.entity_person}`;
+        if (e.details) reply += `\n   📝 _${e.details}_`;
+        reply += '\n';
+      });
+      reply += '\n';
+    }
+
+    reply += `_Tip: Type /balance for full balance sheet or /today for today's agenda._`;
+    await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
 
@@ -1777,6 +1942,7 @@ app.post('/telegram/webhook', async (c) => {
 
     let totalCredits = 0;
     let totalDebits = 0;
+    let totalTransfers = 0;
     let currency = 'INR';
 
     for (const t of txList) {
@@ -1784,6 +1950,8 @@ app.post('/telegram/webhook', async (c) => {
       const amt = Number(t.amount) || 0;
       if (t.tx_type === 'CREDIT') {
         totalCredits += amt;
+      } else if (t.tx_type === 'TRANSFER') {
+        totalTransfers += amt;
       } else {
         totalDebits += amt;
       }
@@ -1797,15 +1965,18 @@ app.post('/telegram/webhook', async (c) => {
     const lines = txList.slice(0, 10).map((t: any) => {
       const s = symbolMap[t.currency] || `${t.currency} `;
       const isCredit = t.tx_type === 'CREDIT';
-      const icon = isCredit ? '🟢' : '🔴';
-      const sign = isCredit ? '+' : '-';
-      return `${icon} (ID: \`#${t.id}\`) *${t.entity_person}:* ${sign}${s}${formatAmount(t.amount, t.currency)} on \`${t.transaction_date}\``;
+      const isTransfer = t.tx_type === 'TRANSFER';
+      const icon = isCredit ? '🟢' : (isTransfer ? '🔄' : '🔴');
+      const sign = isCredit ? '+' : (isTransfer ? '⇄ ' : '-');
+      const badge = isTransfer ? ' _(Transfer/Bill)_' : '';
+      return `${icon} (ID: \`#${t.id}\`) *${t.entity_person}:* ${sign}${s}${formatAmount(t.amount, t.currency)}${badge} on \`${t.transaction_date}\``;
     });
 
     let reply = 
       `⚖️ *Financial Balance Sheet ${period.label}:*\n\n` +
-      `🟢 *Total Inflow (Credits):*  +${sym}${formatAmount(totalCredits, currency)}\n` +
-      `🔴 *Total Outflow (Debits):*  -${sym}${formatAmount(totalDebits, currency)}\n` +
+      `🟢 *Total Inflow (Income):*     +${sym}${formatAmount(totalCredits, currency)}\n` +
+      `🔴 *Total Outflow (Expenses):*  -${sym}${formatAmount(totalDebits, currency)}\n` +
+      (totalTransfers > 0 ? `🔄 *Transfers & Card Bills:*   ⇄ ${sym}${formatAmount(totalTransfers, currency)}\n` : '') +
       `─────────────────────────────\n` +
       `💵 *Net Cash Flow:* *${netFormatted}*\n\n` +
       (lines.length > 0 ? `*Recent Breakdown (Latest ${lines.length}):*\n${lines.join('\n')}\n\n` : '_No transactions found in this period._\n\n') +
@@ -1844,26 +2015,32 @@ app.post('/telegram/webhook', async (c) => {
     const lines = txList.map((t: any) => {
       const sym = symbolMap[t.currency] || `${t.currency} `;
       const isCredit = t.tx_type === 'CREDIT';
-      const icon = isCredit ? '🟢' : '🔴';
-      const sign = isCredit ? '+' : '-';
-      return `${icon} (ID: \`#${t.id}\`) *${t.entity_person}:* ${sign}${sym}${formatAmount(t.amount, t.currency)} on \`${t.transaction_date}\``;
+      const isTransfer = t.tx_type === 'TRANSFER';
+      const icon = isCredit ? '🟢' : (isTransfer ? '🔄' : '🔴');
+      const sign = isCredit ? '+' : (isTransfer ? '⇄ ' : '-');
+      const badge = isTransfer ? ' _(Transfer/Bill)_' : '';
+      return `${icon} (ID: \`#${t.id}\`) *${t.entity_person}:* ${sign}${sym}${formatAmount(t.amount, t.currency)}${badge} on \`${t.transaction_date}\``;
     });
 
     let summaryTotal = '';
     if (txList.length > 0) {
       let credits = 0;
       let debits = 0;
+      let transfers = 0;
       let curr = 'INR';
       for (const t of txList) {
         if (t.currency) curr = t.currency;
         const amt = Number(t.amount) || 0;
         if (t.tx_type === 'CREDIT') credits += amt;
+        else if (t.tx_type === 'TRANSFER') transfers += amt;
         else debits += amt;
       }
       const sym = symbolMap[curr] || `${curr} `;
       const net = credits - debits;
       const netSign = net >= 0 ? '+' : '-';
-      summaryTotal = `\n\n🟢 *Inflow:* +${sym}${formatAmount(credits, curr)} | 🔴 *Outflow:* -${sym}${formatAmount(debits, curr)}\n💵 *Net:* *${netSign}${sym}${formatAmount(Math.abs(net), curr)}* (${txList.length} record${txList.length === 1 ? '' : 's'})`;
+      summaryTotal = `\n\n🟢 *Inflow:* +${sym}${formatAmount(credits, curr)} | 🔴 *Outflow:* -${sym}${formatAmount(debits, curr)}` +
+        (transfers > 0 ? ` | 🔄 *Transfers:* ⇄ ${sym}${formatAmount(transfers, curr)}` : '') +
+        `\n💵 *Net:* *${netSign}${sym}${formatAmount(Math.abs(net), curr)}* (${txList.length} record${txList.length === 1 ? '' : 's'})`;
     }
 
     let reply = '';
@@ -1973,6 +2150,30 @@ app.post('/telegram/webhook', async (c) => {
     return c.json({ ok: true });
   }
 
+  // /transfer or /billpay: Log an internal transfer, credit card bill repayment, or wallet top-up
+  if (cmd === '/transfer' || cmd === '/billpay' || cmd === '/paybill') {
+    if (!args) {
+      await sendTelegramMessage(
+        token,
+        chatId,
+        '⚠️ *Please specify the amount and transfer/bill details.*\n\nExamples:\n• `/transfer 8750 HDFC Credit Card Bill`\n• `/transfer 500 FASTag recharge`\n• `/transfer 1000 Amazon Pay wallet`\n• `/transfer 25000 to SBI Account`'
+      );
+      return c.json({ ok: true });
+    }
+    const { tx } = await extractAndLogExpense(c.env, `Transfer / bill payment of ${args}`, username);
+    const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+    const sym = symbolMap[tx.currency] || `${tx.currency} `;
+    const reply = 
+      `🔄 *Transfer / Bill Payment Logged:*\n` +
+      `• *To / Purpose:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
+      `• *Amount:* ⇄ ${sym}${formatAmount(tx.amount, tx.currency)} (${tx.currency})\n` +
+      `• *Date:* \`${tx.transaction_date}\`\n` +
+      (tx.notes && tx.notes !== tx.entity_person ? `• *Notes:* _${tx.notes}_\n` : '') +
+      `\n_Tip: Type /balance for full balance sheet or /yesterday for daily recap._`;
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
   // /sync: Re-index all ledger records into Vectorize
   if (cmd === '/sync') {
     const { results: transactions } = await c.env.DB.prepare('SELECT * FROM transactions WHERE username = ?').bind(username).all();
@@ -2056,9 +2257,12 @@ app.post('/telegram/webhook', async (c) => {
     const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
     const sym = symbolMap[tx.currency] || `${tx.currency} `;
     const isCredit = tx.tx_type === 'CREDIT';
-    const title = isCredit ? '🟢 *Income / Credit Logged Automatically:*' : '🔴 *Expense / Debit Logged Automatically:*';
-    const partyLabel = isCredit ? 'From / Source' : 'Item / Vendor';
-    const sign = isCredit ? '+' : '-';
+    const isTransfer = tx.tx_type === 'TRANSFER';
+    const title = isCredit 
+      ? '🟢 *Income / Credit Logged Automatically:*' 
+      : (isTransfer ? '🔄 *Transfer / Card Bill Payment Logged Automatically:*' : '🔴 *Expense / Debit Logged Automatically:*');
+    const partyLabel = isCredit ? 'From / Source' : (isTransfer ? 'Account / Card / Wallet' : 'Item / Vendor');
+    const sign = isCredit ? '+' : (isTransfer ? '⇄ ' : '-');
     const reply = 
       `${title}\n` +
       `• *${partyLabel}:* ${tx.entity_person} (ID: \`#${tx.id}\`)\n` +
