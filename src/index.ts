@@ -256,13 +256,13 @@ async function getDailyDigestData(
        ORDER BY id DESC LIMIT 10`
     ).bind(username, targetDate).all(),
 
-    // 3. Upcoming events in next 3 days
+    // 3. Upcoming events & bill deadlines in next 5 days
     env.DB.prepare(
       `SELECT * FROM personal_events 
        WHERE username = ? 
          AND event_date > ? 
-         AND event_date <= date(?, '+3 days') 
-       ORDER BY event_date ASC, id ASC LIMIT 5`
+         AND event_date <= date(?, '+5 days') 
+       ORDER BY event_date ASC, id ASC LIMIT 8`
     ).bind(username, targetDate, targetDate).all(),
 
     // 4. Transactions for target date (today)
@@ -393,13 +393,13 @@ function formatEventsForDigest(
     output += `⏰ *Active Reminders & Daily Habits (${reminders.length}):*\n${remBlocks.join('\n')}\n\n`;
   }
 
-  // 4. Upcoming in Next 3 Days
+  // 4. Upcoming in Next 5 Days (Deadlines & Events)
   if (upcomingEvents.length > 0) {
     const upBlocks = upcomingEvents.map((up) => {
-      const icon = icons[up.category?.toUpperCase()] || '🗓️';
+      const icon = icons[up.category?.toUpperCase()] || (up.category === 'REMINDER' ? '⏰' : '🗓️');
       return `• \`${up.event_date}\`: ${icon} *${up.title}*${up.location ? ` (${up.location})` : ''}`;
     });
-    output += `🗓️ *Upcoming in Next 3 Days:*\n${upBlocks.join('\n')}\n\n`;
+    output += `🗓️ *Upcoming in Next 5 Days (Deadlines & Events):*\n${upBlocks.join('\n')}\n\n`;
   }
 
   // 5. Today's Financial Activity
@@ -670,11 +670,165 @@ function parseSmsDate(text: string): string | null {
   return null;
 }
 
+function isBillReminder(text: string): boolean {
+  const lower = text.toLowerCase();
+
+  // If message clearly indicates money was already debited, spent, transferred, or received, it's a completed transaction, not just a reminder
+  const isCompletedSpend = /\b(debited|debited from|has been debited|paid to|spent|charged to|withdrawn|payment received|recharge.*successful|successful recharge|transferred to|sent to)\b/i.test(lower);
+  if (isCompletedSpend) {
+    return false;
+  }
+
+  // Must have a reminder / due / statement signal
+  const hasDueSignal = (
+    /\b(is due on|due on|due date|due by|pay by|pay before|last date)\b/i.test(lower) ||
+    /\b(total amt due|total amount due|total due|min amt due|minimum amt due|min due|minimum due)\b/i.test(lower) ||
+    /\b(bill generated|statement generated|statement for.*ready|bill for.*ready|e-stmt)\b/i.test(lower) ||
+    /\b(premium due|premium is due|renewal premium|policy.*is due)\b/i.test(lower) ||
+    /\b(bill reminder|payment reminder|electricity bill|broadband bill|water bill|gas bill).*(?:due|pay)\b/i.test(lower)
+  );
+
+  if (!hasDueSignal) {
+    return false;
+  }
+
+  // Must mention an amount or money
+  const hasMoney = /(?:(INR|RS\.?|₹|\$|€|£)\s*[0-9]|[0-9]+\s*(?:inr|rs|usd|\$))/i.test(text);
+  return hasMoney;
+}
+
+async function extractAndLogBillReminder(
+  env: Env,
+  rawText: string,
+  username: string
+): Promise<{ success: boolean; event: any }> {
+  const todayStr = getTodayDateStr(env.USER_TIMEZONE);
+  let parsed: any = null;
+
+  try {
+    const aiRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fp8', {
+      messages: [
+        {
+          role: 'system',
+          content: `You are a financial bill reminder extraction assistant. Today's date is ${todayStr}.
+Analyze the user message (which is a bill due alert, credit card statement notification, insurance premium reminder, or utility bill notification) and extract into a single JSON object with this schema:
+{
+  "biller": "Card, company, or utility name (e.g. 'SBI Card', 'HDFC Life Insurance', 'Electricity Dept', 'Airtel Broadband', 'LIC', 'Torrent Power')",
+  "amount_due": number (The bill amount or total amt due in currency units, e.g. 15450, NOT paise),
+  "min_due": number | null (Minimum amount due if stated, otherwise null),
+  "due_date": "YYYY-MM-DD (resolve dates like 15-Oct-26, 05-Oct-2026, or 'due on 25th' into YYYY-MM-DD)",
+  "account_identifier": "Card number, policy number, consumer number, or CA number if mentioned (e.g. 'Card xx1234', 'Policy 1029384', or null)",
+  "title": "Short concise title (e.g. 'SBI Card Bill Due', 'Electricity Bill Due', 'HDFC Life Premium Due')"
+}
+Return ONLY valid JSON without markdown code fences:`,
+        },
+        { role: 'user', content: rawText },
+      ],
+      max_tokens: 300,
+      temperature: 0.1,
+    });
+
+    let responseText = '';
+    if (typeof aiRes === 'string') responseText = aiRes;
+    else if (aiRes && typeof aiRes === 'object') {
+      responseText = (aiRes as any).response || (aiRes as any).result?.response || JSON.stringify(aiRes);
+    }
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+  } catch (err) {
+    console.warn('AI bill reminder extraction warning:', err);
+  }
+
+  // Deterministic fallbacks
+  const regexAmt = parseAmountAndCurrency(rawText);
+  const amountDue = (parsed?.amount_due && typeof parsed.amount_due === 'number' && parsed.amount_due > 0)
+    ? parsed.amount_due
+    : (regexAmt.amount || 0);
+
+  const dateMatch = parseSmsDate(rawText);
+  const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+  let dueDate = (parsed?.due_date && dateRegex.test(parsed.due_date))
+    ? parsed.due_date
+    : (dateMatch || todayStr);
+
+  const biller = (parsed?.biller && typeof parsed.biller === 'string' && parsed.biller.trim().length > 0)
+    ? parsed.biller.trim()
+    : 'Bill Reminder';
+
+  const symbolMap: Record<string, string> = { USD: '$', INR: '₹', EUR: '€', GBP: '£' };
+  const currency = regexAmt.currency || 'INR';
+  const sym = symbolMap[currency] || `${currency} `;
+  const amtFormatted = amountDue > 0 ? `${sym}${formatAmount(amountDue, currency)}` : '';
+
+  const title = parsed?.title || (amtFormatted ? `${biller} Due: ${amtFormatted}` : `${biller} Due`);
+  let details = `Amount Due: ${amtFormatted || 'Not stated'}`;
+  if (parsed?.min_due) {
+    details += ` (Min Due: ${sym}${formatAmount(parsed.min_due, currency)})`;
+  }
+  if (dueDate) {
+    details += ` | Due Date: ${dueDate}`;
+  }
+  if (parsed?.account_identifier) {
+    details += ` | Ref: ${parsed.account_identifier}`;
+  }
+
+  // Insert into personal_events with category = 'REMINDER'
+  const stmt = env.DB.prepare(`
+    INSERT INTO personal_events (title, category, event_date, location, entity_person, details, username)
+    VALUES (?, 'REMINDER', ?, ?, ?, ?, ?)
+  `);
+  const res = await stmt.bind(title, dueDate, parsed?.account_identifier || null, biller, details, username).run();
+  const eventId = res.meta.last_row_id;
+
+  // Index in Vectorize
+  try {
+    const textToEmbed = `Bill Reminder: ${title} on ${dueDate} for ${biller}. ${details}. Notes: ${rawText}`;
+    const embedRes = await env.AI.run('@cf/baai/bge-small-en-v1.5', { text: [textToEmbed] });
+    await env.VECTORIZE.upsert([
+      {
+        id: `event-${eventId}`,
+        values: embedRes.data[0],
+        metadata: {
+          type: 'event',
+          id: eventId,
+          title,
+          category: 'REMINDER',
+          event_date: dueDate,
+          entity_person: biller,
+          username,
+          text: textToEmbed,
+        },
+      },
+    ]);
+  } catch (err) {
+    console.warn('Vectorize index reminder warning:', err);
+  }
+
+  return {
+    success: true,
+    event: {
+      id: eventId,
+      title,
+      category: 'REMINDER',
+      event_date: dueDate,
+      entity_person: biller,
+      details,
+      amount: amountDue,
+      currency,
+    },
+  };
+}
+
 function isFinancialSmsOrSpend(text: string): boolean {
   const trimmed = text.trim();
 
   // 1. Filter out OTPs, verification codes, and authentication messages (never log OTPs as transactions)
   if (/\b(?:otp|one[- ]time password|verification code|secret code|do not share|never share)\b/i.test(trimmed)) {
+    return false;
+  }
+
+  // 2. Filter out Bill Reminders & Statement Due alerts (these should be logged as REMINDERS, NOT completed transactions!)
+  if (isBillReminder(trimmed)) {
     return false;
   }
 
@@ -979,7 +1133,24 @@ app.all('/sms/webhook', async (c) => {
   const token = c.env.TELEGRAM_BOT_TOKEN;
   const chatId = c.env.TELEGRAM_CHAT_ID;
 
-  // Intelligent Classification: Expense vs Event vs Note
+  // 1. Check if Bill Reminder (credit card statement due, insurance premium due, utility bills)
+  if (isBillReminder(rawText)) {
+    const { event } = await extractAndLogBillReminder(c.env, rawText, username);
+    if (token && chatId) {
+      const reply = 
+        `📱 *Auto-Logged Bill Reminder from SMS:*\n` +
+        `⏰ *${event.title}* (ID: \`#${event.id}\`)\n` +
+        `📅 *Due Date:* \`${event.event_date}\`\n` +
+        `👤 *Biller:* ${event.entity_person}\n` +
+        `📝 *Details:* _${event.details}_\n` +
+        (sender ? `• *Sender:* \`${sender}\`\n` : '') +
+        `\n💡 _You will be alerted in your daily morning briefing as the due date approaches!\nType /bills or /reminders to view pending dues._`;
+      await sendTelegramMessage(token, chatId, reply);
+    }
+    return c.json({ success: true, type: 'bill_reminder', event });
+  }
+
+  // 2. Intelligent Classification: Expense vs Event vs Note
   const isBankSms = isFinancialSmsOrSpend(rawText);
 
   if (isBankSms) {
@@ -1777,6 +1948,7 @@ app.post('/telegram/webhook', async (c) => {
       `• \`/yesterday\` — View yesterday's financial recap (credits, debits, transfers) & events\n` +
       `• \`/today\` or \`/digest\` — View today's agenda & expenses\n` +
       `• \`/today YYYY-MM-DD\` — View agenda for a specific date\n` +
+      `• \`/bills\` or \`/reminders\` — View upcoming bills, due dates & active reminders\n` +
       `• \`/balance [period]\` — View Financial Balance Sheet (e.g. \`/balance\`, \`/balance 2026-09\`, \`/balance 7d\`)\n` +
       `• \`/expenses [period]\` — List transactions (e.g. \`/expenses\`, \`/expenses 2026-09\`, \`/expenses <vendor>\`)\n` +
       `• \`/events\` — List recent life events\n\n` +
@@ -1891,6 +2063,49 @@ app.post('/telegram/webhook', async (c) => {
     }
 
     reply += `_Tip: Type /balance for full balance sheet or /today for today's agenda._`;
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
+  // 3. /bills or /reminders: View all upcoming bills, due dates, and reminders
+  if (cmd === '/bills' || cmd === '/reminders' || cmd === '/dues') {
+    const todayStr = getTodayDateStr(c.env.USER_TIMEZONE);
+    const { results } = await c.env.DB.prepare(
+      `SELECT * FROM personal_events 
+       WHERE username = ? 
+         AND (category = 'REMINDER' OR LOWER(title) LIKE '%bill%' OR LOWER(title) LIKE '%due%')
+         AND event_date >= date(?, '-7 days')
+       ORDER BY event_date ASC, id ASC LIMIT 20`
+    ).bind(username, todayStr).all();
+
+    const remList = (results || []) as any[];
+    if (remList.length === 0) {
+      await sendTelegramMessage(token, chatId, '⏰ *No active bill reminders or deadlines found!*\n\n_Tip: Forward or paste any bill SMS, or use `/remind <details>` to set one._');
+      return c.json({ ok: true });
+    }
+
+    const lines = remList.map((r: any) => {
+      let statusTag = '';
+      if (r.event_date < todayStr) {
+        statusTag = ' ⚠️ *(Overdue)*';
+      } else if (r.event_date === todayStr) {
+        statusTag = ' 🚨 *(Due Today!)*';
+      } else {
+        const diffMs = new Date(r.event_date).getTime() - new Date(todayStr).getTime();
+        const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
+        statusTag = ` _(Due in ${diffDays} day${diffDays === 1 ? '' : 's'})_`;
+      }
+      let line = `• (ID: \`#${r.id}\`) ⏰ *${r.title}*${statusTag}\n   📅 Due Date: \`${r.event_date}\``;
+      if (r.entity_person) line += ` | Biller: *${r.entity_person}*`;
+      if (r.details) line += `\n   📝 _${r.details}_`;
+      return line;
+    });
+
+    const reply = 
+      `⏰ *Active Bill Reminders & Deadlines (${remList.length}):*\n\n` +
+      `${lines.join('\n\n')}\n\n` +
+      `_Tip: Once a bill is paid, remove it with \`/delete <id>\`!_`;
+
     await sendTelegramMessage(token, chatId, reply);
     return c.json({ ok: true });
   }
@@ -2249,7 +2464,21 @@ app.post('/telegram/webhook', async (c) => {
 
   const trimmedText = text.trim();
 
-  // 1. Automatic Financial Transaction / Bank SMS Detection
+  // 1. Automatic Bill Reminder Detection (forwarded bill SMS or pasted due date alert)
+  if (isBillReminder(trimmedText)) {
+    const { event } = await extractAndLogBillReminder(c.env, trimmedText, username);
+    const reply = 
+      `⏰ *Bill Reminder Logged:*\n` +
+      `📌 *${event.title}* (ID: \`#${event.id}\`)\n` +
+      `📅 *Due Date:* \`${event.event_date}\`\n` +
+      `👤 *Biller:* ${event.entity_person}\n` +
+      `📝 *Details:* _${event.details}_\n` +
+      `\n💡 _You will be alerted in your daily morning briefing as the due date approaches!\nType /bills or /reminders to view pending dues._`;
+    await sendTelegramMessage(token, chatId, reply);
+    return c.json({ ok: true });
+  }
+
+  // 2. Automatic Financial Transaction / Bank SMS Detection
   const isBankSms = isFinancialSmsOrSpend(trimmedText);
 
   if (isBankSms) {
