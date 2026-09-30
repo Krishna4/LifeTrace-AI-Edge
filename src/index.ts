@@ -540,9 +540,9 @@ function parseAmountAndCurrency(rawText: string): { amount: number | null; curre
   else if (/£|\bGBP\b/i.test(rawText)) currency = 'GBP';
   else if (/\$|\bUSD\b/i.test(rawText)) currency = 'USD';
 
-  // 1. Currency prefix + amount: e.g. "INR 2,00,000.00", "Rs. 2,71,690", "Rs. 190", "₹1,500", "$50.25"
+  // 1. Currency prefix + amount: e.g. "INR 2,00,000.00", "Rs. 2,71,690", "Rs. 190", "₹1,500", "$50.25", "Rs 8750"
   const prefixMatch = rawText.match(
-    /(?:(INR|RS\.?|₹|\$|€|£)\s*)([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/i
+    /(?:(INR|RS\.?|₹|\$|€|£)\s*)([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)(?![0-9])/i
   );
   if (prefixMatch && prefixMatch[2]) {
     const sym = prefixMatch[1].toUpperCase();
@@ -557,9 +557,9 @@ function parseAmountAndCurrency(rawText: string): { amount: number | null; curre
     }
   }
 
-  // 2. Amount + currency suffix: e.g. "2,71,690 INR", "50 USD", "2000 EUR", "190 Rs"
+  // 2. Amount + currency suffix: e.g. "2,71,690 INR", "50 USD", "2000 EUR", "190 Rs", "8750 INR"
   const suffixMatch = rawText.match(
-    /([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\s*(INR|USD|EUR|GBP|₹|\$|€|£|RS\.?)\b/i
+    /([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)\s*(INR|USD|EUR|GBP|₹|\$|€|£|RS\.?)\b/i
   );
   if (suffixMatch && suffixMatch[1]) {
     const sym = suffixMatch[2].toUpperCase();
@@ -657,7 +657,7 @@ async function extractAndLogExpense(
   // Strip common bank SMS noise, currency symbols, and amount to get fallback entity
   const stripped = rawText
     .replace(/\bAlert:?\b/gi, '')
-    .replace(/(?:INR|RS\.?|₹|\$|€|£)\s*[0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?/gi, '')
+    .replace(/(?:INR|RS\.?|₹|\$|€|£)\s*([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)(?![0-9])/gi, '')
     .replace(/\b(for|on|at|to|spent|bought|paid|INR|USD|EUR|GBP)\b/gi, '')
     .replace(/[$₹€£]/g, '')
     .replace(/[-*#]/g, '')
@@ -747,7 +747,15 @@ Return ONLY valid JSON without markdown code fences:`,
   // Determine final amount:
   let finalAmount = 0;
   if (regexResult.isCurrencyAnchored && regexResult.amount !== null && regexResult.amount > 0) {
-    finalAmount = regexResult.amount;
+    if (aiAmount !== null && aiAmount > 0 && Math.abs(aiAmount - regexResult.amount * 100) < 0.01) {
+      // AI gave paise, regex gave rupees
+      finalAmount = regexResult.amount;
+    } else if (aiAmount !== null && aiAmount > regexResult.amount && (aiAmount === regexResult.amount * 10 || aiAmount === regexResult.amount * 100)) {
+      // Truncation safeguard: If AI extracted the full number (e.g. 8750) and regex was truncated (875), pick the full AI amount
+      finalAmount = aiAmount;
+    } else {
+      finalAmount = regexResult.amount;
+    }
   } else if (aiAmount !== null && aiAmount > 0) {
     if (regexResult.amount !== null && Math.abs(aiAmount - regexResult.amount * 100) < 0.01) {
       finalAmount = regexResult.amount;
@@ -772,7 +780,7 @@ Return ONLY valid JSON without markdown code fences:`,
     if (!isNaN(bVal) && bVal >= 0) balance = bVal;
   }
   if (balance === null) {
-    const balMatch = rawText.match(/\b(?:avail(?:able)?\s*bal(?:ance)?|avl\s*bal|bal)[:\s]*(?:inr|rs\.?|₹)?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/i);
+    const balMatch = rawText.match(/\b(?:avail(?:able)?\s*bal(?:ance)?|avl\s*bal|bal)[:\s]*(?:inr|rs\.?|₹)?\s*([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)(?![0-9])/i);
     if (balMatch && balMatch[1]) {
       const bVal = parseFloat(balMatch[1].replace(/,/g, ''));
       if (!isNaN(bVal) && bVal >= 0) balance = bVal;
